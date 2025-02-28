@@ -9,6 +9,7 @@ import asyncio
 import numpy as np
 
 from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sentence_transformers import SentenceTransformer
 from elasticsearch import AsyncElasticsearch
@@ -514,14 +515,14 @@ async def get_search_service():
     return app.state.search_service
 
 # API Endpoints
-@app.post("/search", response_model=SearchResponse)
+@app.post("/search")
 async def search(
     request: SearchRequest,
     search_service: VectorSearchService = Depends(get_search_service)
 ):
     """Endpoint to search documents using vector similarity"""
     try:
-        response = await search_service.process_search_request(
+        responseData = await search_service.process_search_request(
             request.queries,
             request.tenant_id,
             request.top_k,
@@ -535,10 +536,21 @@ async def search(
         # Optional: Send results to Kafka asynchronously
         # We use create_task to fire and forget
         asyncio.create_task(
-            search_service.send_results_to_kafka(response)
+            search_service.send_results_to_kafka(responseData)
         )
         
-        return response
+         # Extract the response
+        generated_answer = responseData.generated_answer
+        
+        if generated_answer and generated_answer.done and generated_answer.message and generated_answer.message.content:
+            return JSONResponse(content=generated_answer.message)
+
+        # Return a custom response when no valid message is found
+        return JSONResponse(content={
+            "role": "hardcoded",
+            "content": "Sorry, No details found."
+        })
+       
     except Exception as e:
         logger.error(f"Search request failed: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
