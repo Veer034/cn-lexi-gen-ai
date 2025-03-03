@@ -9,13 +9,12 @@ ES_CONFIG = {
     'hosts': ['http://localhost:9200'],
     'username': os.getenv('ES_USERNAME', ''),
     'password': os.getenv('ES_PASSWORD', ''),
-    'index_name': 'messages'
+    'tenant_document_index_name': 'tenant-documents'
 }
 
 KAFKA_CONFIG = {
     'bootstrap_servers': os.getenv('KAFKA_SERVERS', 'localhost:9092'),
-    'output_topic': 'ai.chat.search.analytics',
-    'input_topic':'topicname'
+    'analytics_output_topic': os.getenv('DATA_EXTRACTOR_AI_ANALYTICS_TOPIC', 'data.extractor.ai.analytics')
 }
 
 MISTRAL_CONFIG = {

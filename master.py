@@ -19,138 +19,35 @@ from confluent_kafka import Consumer, KafkaError, KafkaException
 import httpx
 from config import KAFKA_CONFIG, ES_CONFIG, MISTRAL_CONFIG
 from pythonjsonlogger import jsonlogger
+from response import ExtractionAnalyticsDto
 
-# Configure JSON logging
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s"
+)
 logger = logging.getLogger(__name__)
-logHandler = logging.StreamHandler()
-formatter = jsonlogger.JsonFormatter('%(asctime)s %(levelname)s %(name)s %(message)s')
-logHandler.setFormatter(formatter)
-logger.addHandler(logHandler)
-logger.setLevel(logging.INFO)
+
 
 # Define request and response models
 class SearchRequest(BaseModel):
-    queries: List[str]
-    tenant_id: str
-    top_k: int = 5
-    threshold: float = 0.7
-    metadata_filters: Optional[Dict[str, Any]] = None
-    generate_answer: bool = False
-    answer_tone: str = "polite"
-    max_answer_length: int = 300
-
-
-class Message(BaseModel):
-    role: str
-    content: str
-
-class GeneratedAnswer(BaseModel):
-    model: str
-    created_at: str
-    message: Message
-    done_reason: str
-    done: bool
-    total_duration: int
-    load_duration: int
-    prompt_eval_count: int
-    prompt_eval_duration: int
-    eval_count: int
-    eval_duration: int
-
-class RetrievedDocument(BaseModel):
-    document_id: str
-    content: str
-    score: float
-    metadata: Dict[str, Any]
-
-
-class SearchResult(BaseModel):
     query: str
-    results: List[RetrievedDocument]
+    tenantId: str
+    topK: int = 5
+    threshold: float = 0.7
+    metadataFilters: Optional[Dict[str, Any]] = None
+    answerTone: str = "polite"
+    maxAnswerLength: int = 300
+
 
 class SearchResponse(BaseModel):
-    query_id: str
-    processing_time: float
-    generated_answer: Optional[GeneratedAnswer] = None
-    results: List[SearchResult] = Field(..., alias="results")  # Include retrieved documents
+    result: str
+    requestId: str
+
 
 # Initialize app
 app = FastAPI(title="Vector Search Service")
 
-# Async Kafka consumer handler
-async def consume_messages():
-    """Asynchronous kafka consumer to process messages"""
-    consumer_config = {
-        'bootstrap.servers': KAFKA_CONFIG['bootstrap_servers'],
-        'group.id': KAFKA_CONFIG.get('consumer_group', 'vector_search_consumer'),
-        'auto.offset.reset': 'earliest',
-        'enable.auto.commit': False,
-    }
-    
-    consumer = Consumer(consumer_config)
-    consumer.subscribe([KAFKA_CONFIG['input_topic']])
-    
-    try:
-        while True:
-            msg = consumer.poll(1.0)
-            
-            if msg is None:
-                # No message, continue polling
-                await asyncio.sleep(0.1)
-                continue
-                
-            if msg.error():
-                if msg.error().code() == KafkaError._PARTITION_EOF:
-                    # End of partition event
-                    logger.info(f"Reached end of partition {msg.partition()}")
-                else:
-                    logger.error(f"Error while consuming: {msg.error()}")
-            else:
-                try:
-                    # Process the message asynchronously
-                    value = json.loads(msg.value().decode('utf-8'))
-                    
-                    # Create a task to process the message asynchronously
-                    asyncio.create_task(process_kafka_message(value))
-                    
-                    # Commit the message manually
-                    consumer.commit(msg)
-                except Exception as e:
-                    logger.error(f"Error processing message: {str(e)}", exc_info=True)
-    
-    except KeyboardInterrupt:
-        pass
-    finally:
-        consumer.close()
-
-async def process_kafka_message(message):
-    """Process a message from Kafka"""
-    try:
-        # Get the search service
-        search_service = app.state.search_service
-        
-        # Process the message based on its contents
-        logger.info(f"Processing Kafka message: {message}")
-        
-        # Example: You might have different types of messages to process
-        if 'request_type' in message:
-            if message['request_type'] == 'search':
-                # Process a search request
-                result = await search_service.process_search_request(
-                    message['queries'],
-                    message['tenant_id'],
-                    message.get('top_k', 5),
-                    message.get('threshold', 0.7),
-                    message.get('metadata_filters'),
-                    message.get('generate_answer', False),
-                    message.get('answer_tone', 'polite'),
-                    message.get('max_answer_length', 300)
-                )
-                
-                # Produce result to output topic if needed
-                await search_service.send_results_to_kafka(result)
-    except Exception as e:
-        logger.error(f"Error processing Kafka message: {str(e)}", exc_info=True)
 
 class AsyncKafkaProducer:
     """Wrapper for Kafka producer with async interface"""
@@ -165,7 +62,7 @@ class AsyncKafkaProducer:
             self._produce, topic, key, value
         )
     
-    def _produce(self, topic, key, value):
+    def _produce(self, topic, key, value, callback=None):
         """Send message to Kafka topic"""
         try:
             if isinstance(value, dict):
@@ -176,7 +73,7 @@ class AsyncKafkaProducer:
             if key is not None and not isinstance(key, bytes):
                 key = str(key).encode('utf-8')
                 
-            self.producer.produce(topic, key=key, value=value)
+            self.producer.produce(topic, key=key, value=value, callback=callback)
             self.producer.flush()
             return True
         except Exception as e:
@@ -195,6 +92,7 @@ class VectorSearchService:
         model_name = 'paraphrase-multilingual-mpnet-base-v2'
         model_path = models_path or os.path.join(os.getcwd(), 'models', 'sentence_transformer')
         
+
         # Use downloaded model if available, otherwise use the model name directly
         if os.path.exists(model_path):
             logger.info(f"Loading model from local path: {model_path}")
@@ -226,25 +124,25 @@ class VectorSearchService:
         # Create a pool of workers for CPU-bound tasks
         self.process_pool = None
     
-    async def generate_embeddings(self, queries: List[str]) -> List[List[float]]:
+    async def generate_embeddings(self, query: str) -> List[float]:
         """Generate embeddings for a list of queries using a thread pool"""
         try:
             start_time = datetime.datetime.now()
             
             # Move the embedding generation to a separate thread 
             # since SentenceTransformer is not async-compatible
-            embeddings = await asyncio.to_thread(self._generate_embeddings_sync, queries)
+            embeddings = await asyncio.to_thread(self._generate_embeddings_sync, query)
             
             end_time = datetime.datetime.now()
-            logger.info(f"Generated {len(queries)} embeddings in {(end_time - start_time).total_seconds()} seconds")
+            logger.info(f"Generated {len(query)} embeddings in {(end_time - start_time).total_seconds()} seconds")
             return embeddings
         except Exception as e:
             logger.error(f"Error generating embeddings: {str(e)}", exc_info=True)
             raise
     
-    def _generate_embeddings_sync(self, queries: List[str]) -> List[List[float]]:
+    def _generate_embeddings_sync(self, query: str) -> List[float]:
         """Synchronous method to generate embeddings (runs in a thread)"""
-        embeddings = self.st_model.encode(queries)
+        embeddings = self.st_model.encode(query)
         return embeddings.tolist()
     
 
@@ -253,14 +151,14 @@ class VectorSearchService:
         embedding: List[float], 
         tenant_id: str, 
         top_k: int = 5, 
-        threshold: float = 0.7,
+        threshold: float = 0.55,
         metadata_filters: Optional[Dict[str, Any]] = None
     ) -> List[Dict[str, Any]]:
         """Search Elasticsearch using dot product with normalized vectors for ES 7.17"""
         try:
             
             # Build the filter conditions
-            filter_conditions = [{"term": {"tenant_id": tenant_id}}]
+            filter_conditions = [{"term": {"tenantId": tenant_id}}]
             
             # Add metadata filters if provided
             if metadata_filters:
@@ -272,6 +170,7 @@ class VectorSearchService:
             
             # Build the query
             query = {
+                "_source": ["content"],
                 "query": {
                     "script_score": {
                         "query": {
@@ -280,67 +179,67 @@ class VectorSearchService:
                             }
                         },
                         "script": {
-                            "source": "cosineSimilarity(params.query_vector, 'content_vector')",
+                            "source": "cosineSimilarity(params.query_vector, 'contentVector')",
                             "params": {"query_vector": embedding}
                         }
                     }
                 }
             }
             
-            logger.info("query: ")
-            logger.info(query)
-            
             # Execute search
             response = await self.es_client.search(
-                index=ES_CONFIG['index_name'],
+                index=ES_CONFIG['tenant_document_index_name'],
                 body=query,
                 size=top_k
             )
             
+
             # Process results
-            results = []
+            results = {
+                "esTime": response['took'],
+                "contents": []
+            }
             for hit in response['hits']['hits']:
                 score = hit['_score']
-                # Note: With normalized vectors, dot product results range from -1 to 1,
-                # same as cosine similarity
                 if score >= threshold:
-                    results.append({
-                        "content": hit['_source']['content'],
-                        "document_id": hit['_source']['document_id'],
-                        "score": score,
-                        "metadata": hit['_source'].get('metadata', {})
-                    })
+                    results["contents"].append(hit['_source']['content'])
             
+
             return results
         except Exception as e:
             logger.error(f"Error searching Elasticsearch: {str(e)}", exc_info=True)
             raise
     
 
-    async def generate_answer_from_results(
+    async def generate_answer_from_mistral(
         self,
         query: str,
-        results: List[Dict[str, Any]],
+        contents: List[str],
+        language: str,
         tone: str = "polite",
-        max_length: int = 300
-    ) -> Dict[str, Any]:
+        max_length: int = 200,
+        ) -> Dict[str, Any]:
         """Generate an answer to the query using LLM based on the search results"""
         try:
-            # Combine result contents into context
-            context = "\n\n".join([result["content"] for result in results if "content" in result])
+            # Combine contents into context
+            context = "\n\n".join(contents)  # Direct join of string array
+       
+            # Further refined system prompt that encourages direct, concise answers
+            system_prompt = f"""You are a customer service assistant. When answering questions:
+            1. Give only the specific information requested - nothing more
+            2. Use a {tone} but extremely concise tone
+            3. Keep your answer exact to the point.
+            4. Never use generic customer service phrases like "please don't hesitate to ask"
+            5. Never add offers for additional help at the end of your response
+            6. Don't acknowledge the source of your information
+            7. Just answer the exact question with the minimum necessary words"""
             
-            # Prepare the prompt for model
-            system_prompt = f"""You are a helpful assistant that answers questions based on provided documents. 
-            Please respond in a {tone} tone. Keep your answer concise, around {max_length} characters.
-            Use only the information from the documents to answer the question. If the documents don't contain
-            the necessary information, admit that you don't know."""
-            
-            user_prompt = f"""Documents:
+            user_prompt = f"""Reference content:
             {context}
             
             Question: {query}
             
-            Please answer the question based only on the provided documents."""
+            Provide only the direct answer in {language} language."""
             
             # Prepare the request payload
             data = {
@@ -350,128 +249,223 @@ class VectorSearchService:
                     {"role": "user", "content": user_prompt}
                 ],
                 "stream": False,
-                "max_tokens": max(100, max_length // 4)  # Estimate tokens based on characters
+                "max_tokens": max(50, max_length // 4)  # Further reduced token limit to encourage brevity
             }
             
             logger.info("Sending request to LLM: %s", json.dumps(data, indent=2))
             
             # Use httpx for async request
-            async with self.http_client as client:
-                response = await client.post(
+            response = await self.http_client.post(
                     MISTRAL_CONFIG['service_url'],
                     headers={"Content-Type": "application/json"},
                     json=data,
                     timeout=MISTRAL_CONFIG['timeout']
-                )
+            )
             
-            logger.info("Response Status: %d", response.status_code)
             
             if response.status_code != 200:
                 logger.error(f"LLM service error: {response.status_code} - {response.text}")
                 return {"error": f"Error generating answer: LLM service returned status {response.status_code}"}
+            
+            logger.info(f"Response Status: {response.json()}" )
             
             return response.json()
             
         except Exception as e:
             logger.error(f"Error generating answer with LLM: {str(e)}", exc_info=True)
             return {"error": f"Error generating answer: {str(e)}"}
-    
+        
+    def detect_language(self, text: str) -> str:
+        """
+        Language detection with support for 70+ languages.
+        
+        Args:
+            text: Text to detect language for
+            
+        Returns:
+            ISO language code
+        """
+        try:
+            from langdetect import detect, DetectorFactory
+            # Set seed for deterministic results
+            DetectorFactory.seed = 0
+            return detect(text)
+        except (ImportError, Exception) as e:
+            logger.warning(f"Error using langdetect: {str(e)}. Falling back to script-based detection.")
+            
+            # Script-based detection for non-Latin scripts
+            # Devanagari (Hindi, Marathi, Nepali)
+            if re.search(r'[\u0900-\u097F]', text):
+                return 'hi'  # Default to Hindi
+                
+            # Bengali
+            if re.search(r'[\u0980-\u09FF]', text):
+                return 'bn'
+                
+            # Gurmukhi (Punjabi)
+            if re.search(r'[\u0A00-\u0A7F]', text):
+                return 'pa'
+                
+            # Gujarati
+            if re.search(r'[\u0A80-\u0AFF]', text):
+                return 'gu'
+                
+            # Tamil
+            if re.search(r'[\u0B80-\u0BFF]', text):
+                return 'ta'
+                
+            # Telugu
+            if re.search(r'[\u0C00-\u0C7F]', text):
+                return 'te'
+                
+            # Kannada
+            if re.search(r'[\u0C80-\u0CFF]', text):
+                return 'kn'
+                
+            # Malayalam
+            if re.search(r'[\u0D00-\u0D7F]', text):
+                return 'ml'
+                
+            # Sinhala
+            if re.search(r'[\u0D80-\u0DFF]', text):
+                return 'si'
+                
+            # Thai
+            if re.search(r'[\u0E00-\u0E7F]', text):
+                return 'th'
+                
+            # Cyrillic
+            if re.search(r'[\u0400-\u04FF]', text):
+                # Try to distinguish between Cyrillic languages
+                if re.search(r'[ії]', text):
+                    return 'uk'  # Ukrainian
+                elif re.search(r'[ђљњ]', text):
+                    return 'sr-cyr'  # Serbian Cyrillic
+                else:
+                    return 'ru'  # Default to Russian
+                
+            # Greek
+            if re.search(r'[\u0370-\u03FF]', text):
+                return 'el'
+                
+            # Hebrew
+            if re.search(r'[\u0590-\u05FF]', text):
+                return 'he'
+                
+            # Arabic
+            if re.search(r'[\u0600-\u06FF]', text):
+                # Try to distinguish between Arabic script languages
+                if re.search(r'[پچژگ]', text):
+                    return 'fa'  # Persian
+                elif re.search(r'[ٹڈڑں]', text):
+                    return 'ur'  # Urdu
+                else:
+                    return 'ar'  # Default to Arabic
+                
+            # CJK (Chinese, Japanese, Korean)
+            if re.search(r'[\u3040-\u30FF]', text):
+                return 'ja'  # Japanese-specific characters
+            elif re.search(r'[\uAC00-\uD7AF]', text):
+                return 'ko'  # Korean-specific characters
+            elif re.search(r'[\u4E00-\u9FFF]', text):
+                return 'zh'  # Default to Chinese for general CJK
+                
+            # Default to English for primarily Latin script
+            return 'en'
+
+
     async def process_search_request(
         self, 
-        queries: List[str], 
+        query: str, 
         tenant_id: str, 
         top_k: int = 5, 
         threshold: float = 0.7,
         metadata_filters: Optional[Dict[str, Any]] = None,
-        generate_answer: bool = False,
         answer_tone: str = "polite",
         max_answer_length: int = 300
     ) -> Dict[str, Any]:
         """Process a search request end-to-end using async operations"""
-        start_time = datetime.datetime.now()
         
+        language = self.detect_language(query)
+
+
         # Generate embeddings for all queries
-        embeddings = await self.generate_embeddings(queries)
+        embedding = await self.generate_embeddings(query)
         
         # Create tasks for concurrent Elasticsearch searches
-        search_tasks = [
-            self.search_elasticsearch(
+        search_result = await self.search_elasticsearch(
                 embedding, 
                 tenant_id, 
                 top_k, 
                 threshold,
                 metadata_filters
             ) 
-            for embedding in embeddings
-        ]
         
-        # Run searches concurrently
-        search_results = await asyncio.gather(*search_tasks)
-        
-        # Process results and generate answers if requested
-        all_results = []
-        generated_answer = None
-        
-        # Create tasks for generating answers if needed
-        answer_tasks = []
-        
-        for i, results in enumerate(search_results):
-            # If we need to generate an answer and have valid results
-            if generate_answer and results and len(results) > 0:
-                answer_tasks.append((i, self.generate_answer_from_results(
-                    queries[i],
-                    results,
-                    tone=answer_tone,
-                    max_length=max_answer_length
-                )))
-            
-            all_results.append({
-                "query": queries[i],
-                "results": results
-            })
-        
-        # Run answer generation concurrently if there are any tasks
-        if answer_tasks:
-            # We need to keep track of which query each answer belongs to
-            answers = await asyncio.gather(*(task for _, task in answer_tasks))
-            # The first valid answer will be our generated_answer
-            if answers:
-                generated_answer = answers[0]
-        
-        end_time = datetime.datetime.now()
-        processing_time = (end_time - start_time).total_seconds()
-        
-        # Prepare response
-        query_id = str(uuid.uuid4())
-        response = {
-            "query_id": query_id,
-            "results": all_results,
-            "processing_time": processing_time
-        }
-        
-        # Add generated answer if available
-        if generated_answer:
-            response["generated_answer"] = generated_answer
-        
-        logger.info(f"Processed search request with ID: {query_id}, processing time: {processing_time}s")
-        return response
     
-    async def send_results_to_kafka(self, results: Dict[str, Any]) -> bool:
-        """Send search results to Kafka topic for async processing"""
-        if self.producer is None:
-            logger.warning("Kafka producer not initialized, skipping message")
-            return False
         
-        try:
-            await self.producer.send(
-                KAFKA_CONFIG['output_topic'],
-                value=results
+        if search_result["contents"]:
+            mistral_response = await self.generate_answer_from_mistral(
+                query,
+                search_result["contents"],
+                language=language,
+                tone=answer_tone,
+                max_length=max_answer_length,
             )
-            return True
-        except Exception as e:
-            logger.error(f"Error sending to Kafka: {str(e)}", exc_info=True)
-            return False
-    
+
+            # Add extracted details to search_result
+            message = mistral_response.get("message", {})
+            content = message.get("content", "")
+
+            search_result["answer"] = content
+            search_result["total_duration"] = mistral_response.get("total_duration", 0)
+            search_result["load_duration"] = mistral_response.get("load_duration", 0)
+            search_result["prompt_eval_duration"] = mistral_response.get("prompt_eval_duration", 0)
+            search_result["eval_duration"] = mistral_response.get("eval_duration", 0)
+
+
+            logger.info(
+                f"Processed search request for query: {query}, "
+                f"Response: {search_result['answer']}, "
+                f"Total Duration: {search_result['total_duration']}, "
+                f"Load Duration: {search_result['load_duration']}"
+            )
+
+          
+
+        else:
+            search_result["answer"] =  ""
+            search_result["total_duration"] = 0
+            search_result["load_duration"] = 0
+            search_result["prompt_eval_duration"] = 0
+            search_result["eval_duration"] = 0
+
+
+
+
+        return search_result  # Returning updated search_result
+        
+
+    async def publish_analytics_report_to_kafka(self, tenant_id:str, topic: str, analyticsDto: ExtractionAnalyticsDto):
+        """
+        Publishes analytics data to a Kafka topic.
+        """
+        # Serialize key and value
+        serialized_key = str(tenant_id).encode("utf-8")
+        serialized_analytics = json.dumps(analyticsDto.model_dump(), default=str).encode("utf-8")
+
+        # Create an asyncio Future to wait for delivery report
+        future = asyncio.Future()
+        
+        def delivery_callback(err, msg):
+            if err:
+                future.set_exception(Exception(f"Message delivery failed: {err}"))
+            else:
+                future.set_result(msg)
+        
+        self.producer._produce(topic, key=serialized_key, value=serialized_analytics, callback=delivery_callback)
+        
+        return await future
+
     async def close(self):
         """Close connections and resources"""
         if self.producer:
@@ -489,9 +483,7 @@ async def startup_event():
     # Initialize the search service
     app.state.search_service = VectorSearchService()
     
-    # Start the Kafka consumer in the background
-    app.state.consumer_task = asyncio.create_task(consume_messages())
-    
+
     logger.info("Vector Search Service initialized")
     logger.info(f"Using Mistral service at: {MISTRAL_CONFIG['service_url']}")
 
@@ -522,38 +514,62 @@ async def search(
 ):
     """Endpoint to search documents using vector similarity"""
     try:
-        responseData = await search_service.process_search_request(
-            request.queries,
-            request.tenant_id,
-            request.top_k,
-            request.threshold,
-            request.metadata_filters,
-            request.generate_answer,
-            request.answer_tone,
-            request.max_answer_length
-        )
-        
-        # Optional: Send results to Kafka asynchronously
-        # We use create_task to fire and forget
-        asyncio.create_task(
-            search_service.send_results_to_kafka(responseData)
-        )
-        
-         # Extract the response
-        generated_answer = responseData.generated_answer
-        
-        if generated_answer and generated_answer.done and generated_answer.message and generated_answer.message.content:
-            return JSONResponse(content=generated_answer.message)
+        # Generate a request ID for this specific request
+        request_id = str(uuid.uuid4())
+        logger.info(f"[{request_id}] Processing search request with query: {request.query}")
 
-        # Return a custom response when no valid message is found
-        return JSONResponse(content={
-            "role": "hardcoded",
-            "content": "Sorry, No details found."
-        })
+        responseData = await search_service.process_search_request(
+            request.query,
+            request.tenantId,
+            request.topK,
+            request.threshold,
+            request.metadataFilters,
+            request.answerTone,
+            request.maxAnswerLength
+        )
+
+        logger.info(f"responseData: {responseData}")
+        
+         # Extract analytics data from response if it has mistral performance metrics
+        if responseData and isinstance(responseData, dict) and 'total_duration' in responseData:
+            analytics_data = ExtractionAnalyticsDto(
+                tenantId=request.tenantId,
+                query=request.query,
+                answer=  responseData.get("answer",''),
+                contents = responseData.get('contents', []),
+                totalDuration=responseData.get('total_duration', 0),
+                loadDuration=responseData.get('load_duration', 0),
+                promptEvalDuration=responseData.get('prompt_eval_duration', 0),
+                evalDuration=responseData.get('eval_duration', 0)
+            )
+            
+            # Send results to Kafka asynchronously
+            # We use create_task to fire and forget
+            asyncio.create_task(
+                search_service.publish_analytics_report_to_kafka(
+                    request.tenantId,
+                    KAFKA_CONFIG['analytics_output_topic'],
+                    analytics_data
+                )
+            )
+        
+
+        answer  = responseData.get('answer', "Sorry, No details found.")
+        
+       
+        logger.info(f"[{request_id}] Search completed successfully")
+        return SearchResponse(result=answer, requestId=request_id)
+
        
     except Exception as e:
-        logger.error(f"Search request failed: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        error_msg = f"Search request failed: {str(e)}"
+        logger.error(f"[{request_id}] {error_msg}", exc_info=True)
+        
+        # Return a custom error response that includes the request_id
+        raise HTTPException(
+            status_code=500, 
+            detail={"error": 'Something went wrong', "request_id": request_id}
+        )
 
 @app.get("/health")
 async def health_check(search_service: VectorSearchService = Depends(get_search_service)):
@@ -569,12 +585,11 @@ async def health_check(search_service: VectorSearchService = Depends(get_search_
         mistral_healthy = False
         try:
             # Simple ping to Mistral service
-            async with search_service.http_client as client:
-                response = await client.get(
+            response = await search_service.http_client.get(
                     MISTRAL_CONFIG['service_url'].split('/v1')[0] + '/health',
                     timeout=5
-                )
-                mistral_healthy = response.status_code == 200
+            )
+            mistral_healthy = response.status_code == 200
         except Exception as e:
             logger.warning(f"Mistral service health check failed: {str(e)}")
         

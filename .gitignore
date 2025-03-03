@@ -1,0 +1,23 @@
+# Logs
+*.log
+*.out
+*.err
+
+
+# Virtual environment
+venv/
+myvenv/
+models/
+.env/
+__pycache__/
+
+
+# VSCode
+.vscode/
+
+# macOS
+.DS_Store
+
+
+#models
+.safetensors
