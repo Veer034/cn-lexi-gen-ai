@@ -24,6 +24,7 @@ Activiate Env
     python3.10 -m venv myvenv
     source myvenv/bin/activate
 
+    #make sure version is 3.10.*
     python --version
 
 Install library in local VM
@@ -32,7 +33,10 @@ Install library in local VM
     brew install librdkafka
 
 
-    pip install "numpy<2.0.0"  sentence-transformers torch elasticsearch confluent-kafka httpx aiohttp python-json-logger transformers python-dotenv nltk langdetect fastapi uvicorn gunicorn pydantic asyncio
+    pip install "numpy<2.0.0"  sentence-transformers torch elasticsearch confluent-kafka httpx aiohttp python-json-logger transformers python-dotenv nltk langdetect fastapi uvicorn gunicorn pydantic asyncio  fasttext regex
+
+    #For language detection
+    pip install langdetect fasttext lingua-language-detector pycld2 polyglot pyicu morfessor
 
 Start in local
 

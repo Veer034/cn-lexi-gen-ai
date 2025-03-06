@@ -3,10 +3,11 @@ FROM python:3.10-slim
 WORKDIR /app
 
 # Install system dependencies
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     librdkafka-dev \
-    && rm -rf /var/lib/apt/lists/*
+    g++ \
+    && rm -rf /var/lib/apt/lists/*    
 
 # Install Python packages
 RUN pip install --no-cache-dir "numpy<2.0.0" \
@@ -26,8 +27,13 @@ RUN pip install --no-cache-dir "numpy<2.0.0" \
     gunicorn==21.2.0 \
     pydantic==2.5.2 \
     aiokafka==0.10.0 \
-    asyncio==3.4.3
-
+    asyncio==3.4.3 \
+    langdetect==1.0.9 \
+    fasttext==0.9.2 \
+    lingua-language-detector==1.3.2 \
+    pycld2==0.41 \
+    polyglot==16.7.4 \
+    morfessor==2.0.6
 
 
 # Copy your application

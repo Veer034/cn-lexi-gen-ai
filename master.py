@@ -20,7 +20,8 @@ import httpx
 from config import KAFKA_CONFIG, ES_CONFIG, MISTRAL_CONFIG
 from pythonjsonlogger import jsonlogger
 from response import ExtractionAnalyticsDto
-
+from manalLangaugeDetection import ManualLanguageDetector
+from libaryLanguage import LibraryLanguageDetector
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -33,6 +34,7 @@ logger = logging.getLogger(__name__)
 class SearchRequest(BaseModel):
     query: str
     tenantId: str
+    language:  str  
     topK: int = 5
     threshold: float = 0.7
     metadataFilters: Optional[Dict[str, Any]] = None
@@ -40,13 +42,15 @@ class SearchRequest(BaseModel):
     maxAnswerLength: int = 300
 
 
-class SearchResponse(BaseModel):
+class AISearchResultDto(BaseModel):
     result: str
     requestId: str
+    contentSize: int
 
 
 # Initialize app
 app = FastAPI(title="Vector Search Service")
+
 
 
 class AsyncKafkaProducer:
@@ -123,6 +127,13 @@ class VectorSearchService:
         
         # Create a pool of workers for CPU-bound tasks
         self.process_pool = None
+
+
+        # Create detector
+        self.manualDetector = ManualLanguageDetector()
+        self.libraryDetector = LibraryLanguageDetector()
+
+
     
     async def generate_embeddings(self, query: str) -> List[float]:
         """Generate embeddings for a list of queries using a thread pool"""
@@ -150,6 +161,7 @@ class VectorSearchService:
         self, 
         embedding: List[float], 
         tenant_id: str, 
+        language: str,
         top_k: int = 5, 
         threshold: float = 0.55,
         metadata_filters: Optional[Dict[str, Any]] = None
@@ -158,7 +170,7 @@ class VectorSearchService:
         try:
             
             # Build the filter conditions
-            filter_conditions = [{"term": {"tenantId": tenant_id}}]
+            filter_conditions = [{"term": {"tenantId": tenant_id}}, {"term": {"metadata.language": language}}]
             
             # Add metadata filters if provided
             if metadata_filters:
@@ -170,7 +182,7 @@ class VectorSearchService:
             
             # Build the query
             query = {
-                "_source": ["content"],
+                
                 "query": {
                     "script_score": {
                         "query": {
@@ -185,6 +197,8 @@ class VectorSearchService:
                     }
                 }
             }
+
+            logger.info(f" query {query}")
             
             # Execute search
             response = await self.es_client.search(
@@ -219,27 +233,42 @@ class VectorSearchService:
         tone: str = "polite",
         max_length: int = 200,
         ) -> Dict[str, Any]:
-        """Generate an answer to the query using LLM based on the search results"""
+        """
+        Generate an answer to the query using LLM based strictly on the provided context
+        
+        Args:
+            query (str): The specific question to be answered
+            contents (List[str]): List of context strings to base the answer on
+            language (str): Language of the response
+            tone (str): Tone of the response
+            max_length (int): Maximum length of the response
+        
+        Returns:
+            Dict[str, Any]: LLM response or error details
+        """
         try:
             # Combine contents into context
             context = "\n\n".join(contents)  # Direct join of string array
-       
-            # Further refined system prompt that encourages direct, concise answers
-            system_prompt = f"""You are a customer service assistant. When answering questions:
-            1. Give only the specific information requested - nothing more
-            2. Use a {tone} but extremely concise tone
-            3. Keep your answer exact to the point.
-            4. Never use generic customer service phrases like "please don't hesitate to ask"
-            5. Never add offers for additional help at the end of your response
-            6. Don't acknowledge the source of your information
-            7. Just answer the exact question with the minimum necessary words"""
+    
+            # Strict system prompt to force context-only responses
+            system_prompt = f"""CRITICAL INSTRUCTIONS:
+            1. You MUST ONLY answer based on the EXACT provided context
+            2. If the answer CANNOT be found in the context, return an empty string ""
+            3. Use a {tone} but extremely concise tone
+            4. Keep your answer exact to the point
+            5. Never use generic phrases or add extra information
+            6. Do NOT rely on any previous knowledge or conversations
+            7. Your response must be strictly derived from the reference content
+            8. VERY IMPORTANT: Entire response MUST be under {max_length // 4} tokens"""
             
-            user_prompt = f"""Reference content:
+            # User prompt emphasizing context-only response
+            user_prompt = f"""Reference content ONLY:
             {context}
             
             Question: {query}
             
-            Provide only the direct answer in {language} language."""
+            IMPORTANT: Provide ONLY an answer found EXACTLY in the given context in {language} language. 
+            If NO answer exists in the context, return an empty string."""
             
             # Prepare the request payload
             data = {
@@ -249,135 +278,41 @@ class VectorSearchService:
                     {"role": "user", "content": user_prompt}
                 ],
                 "stream": False,
-                "max_tokens": max(50, max_length // 4)  # Further reduced token limit to encourage brevity
+                "max_tokens": max_length // 4
             }
             
-            logger.info("Sending request to LLM: %s", json.dumps(data, indent=2))
+            # Log the request for debugging
+            logger.info("Sending context-constrained request to LLM: %s", json.dumps(data, indent=2))
             
             # Use httpx for async request
             response = await self.http_client.post(
-                    MISTRAL_CONFIG['service_url'],
+                    MISTRAL_CONFIG['chat_url'],
                     headers={"Content-Type": "application/json"},
                     json=data,
                     timeout=MISTRAL_CONFIG['timeout']
             )
             
-            
+            # Error handling for non-200 responses
             if response.status_code != 200:
                 logger.error(f"LLM service error: {response.status_code} - {response.text}")
                 return {"error": f"Error generating answer: LLM service returned status {response.status_code}"}
             
-            logger.info(f"Response Status: {response.json()}" )
+            # Log and return the response
+            response_data = response.json()
+            logger.info(f"Context-constrained Response Status: {response_data}")
             
-            return response.json()
+            return response_data
             
         except Exception as e:
             logger.error(f"Error generating answer with LLM: {str(e)}", exc_info=True)
             return {"error": f"Error generating answer: {str(e)}"}
-        
-    def detect_language(self, text: str) -> str:
-        """
-        Language detection with support for 70+ languages.
-        
-        Args:
-            text: Text to detect language for
-            
-        Returns:
-            ISO language code
-        """
-        try:
-            from langdetect import detect, DetectorFactory
-            # Set seed for deterministic results
-            DetectorFactory.seed = 0
-            return detect(text)
-        except (ImportError, Exception) as e:
-            logger.warning(f"Error using langdetect: {str(e)}. Falling back to script-based detection.")
-            
-            # Script-based detection for non-Latin scripts
-            # Devanagari (Hindi, Marathi, Nepali)
-            if re.search(r'[\u0900-\u097F]', text):
-                return 'hi'  # Default to Hindi
-                
-            # Bengali
-            if re.search(r'[\u0980-\u09FF]', text):
-                return 'bn'
-                
-            # Gurmukhi (Punjabi)
-            if re.search(r'[\u0A00-\u0A7F]', text):
-                return 'pa'
-                
-            # Gujarati
-            if re.search(r'[\u0A80-\u0AFF]', text):
-                return 'gu'
-                
-            # Tamil
-            if re.search(r'[\u0B80-\u0BFF]', text):
-                return 'ta'
-                
-            # Telugu
-            if re.search(r'[\u0C00-\u0C7F]', text):
-                return 'te'
-                
-            # Kannada
-            if re.search(r'[\u0C80-\u0CFF]', text):
-                return 'kn'
-                
-            # Malayalam
-            if re.search(r'[\u0D00-\u0D7F]', text):
-                return 'ml'
-                
-            # Sinhala
-            if re.search(r'[\u0D80-\u0DFF]', text):
-                return 'si'
-                
-            # Thai
-            if re.search(r'[\u0E00-\u0E7F]', text):
-                return 'th'
-                
-            # Cyrillic
-            if re.search(r'[\u0400-\u04FF]', text):
-                # Try to distinguish between Cyrillic languages
-                if re.search(r'[ії]', text):
-                    return 'uk'  # Ukrainian
-                elif re.search(r'[ђљњ]', text):
-                    return 'sr-cyr'  # Serbian Cyrillic
-                else:
-                    return 'ru'  # Default to Russian
-                
-            # Greek
-            if re.search(r'[\u0370-\u03FF]', text):
-                return 'el'
-                
-            # Hebrew
-            if re.search(r'[\u0590-\u05FF]', text):
-                return 'he'
-                
-            # Arabic
-            if re.search(r'[\u0600-\u06FF]', text):
-                # Try to distinguish between Arabic script languages
-                if re.search(r'[پچژگ]', text):
-                    return 'fa'  # Persian
-                elif re.search(r'[ٹڈڑں]', text):
-                    return 'ur'  # Urdu
-                else:
-                    return 'ar'  # Default to Arabic
-                
-            # CJK (Chinese, Japanese, Korean)
-            if re.search(r'[\u3040-\u30FF]', text):
-                return 'ja'  # Japanese-specific characters
-            elif re.search(r'[\uAC00-\uD7AF]', text):
-                return 'ko'  # Korean-specific characters
-            elif re.search(r'[\u4E00-\u9FFF]', text):
-                return 'zh'  # Default to Chinese for general CJK
-                
-            # Default to English for primarily Latin script
-            return 'en'
-
+             
 
     async def process_search_request(
         self, 
         query: str, 
         tenant_id: str, 
+        language: str,
         top_k: int = 5, 
         threshold: float = 0.7,
         metadata_filters: Optional[Dict[str, Any]] = None,
@@ -386,8 +321,6 @@ class VectorSearchService:
     ) -> Dict[str, Any]:
         """Process a search request end-to-end using async operations"""
         
-        language = self.detect_language(query)
-
 
         # Generate embeddings for all queries
         embedding = await self.generate_embeddings(query)
@@ -395,7 +328,8 @@ class VectorSearchService:
         # Create tasks for concurrent Elasticsearch searches
         search_result = await self.search_elasticsearch(
                 embedding, 
-                tenant_id, 
+                tenant_id,
+                language, 
                 top_k, 
                 threshold,
                 metadata_filters
@@ -466,6 +400,31 @@ class VectorSearchService:
         
         return await future
 
+
+    def detect_best_language(self,text):
+        # 1. For very short texts, try pattern matching first
+        if len(text.split()) >= 5:  # Short customer queries
+            service_lang = self.manualDetector.make_best_guess(text)
+            return service_lang
+                
+        # 2. Try libraries next
+        if len(self.libraryDetector.available_libraries) > 0:
+            lib_signals = self.libraryDetector._detect_with_libraries(text)
+            logger.info(f" libraryDetector {lib_signals} ")
+            
+            if lib_signals:
+                # Get best library result
+                best_signal = max(lib_signals, key=lambda x: x[2])
+                _, lang, conf = best_signal
+                if conf > 0.5:  # If reasonably confident
+                    return lang
+                    
+        # 3. Fall back to combined approach
+        return 'en'
+
+
+
+
     async def close(self):
         """Close connections and resources"""
         if self.producer:
@@ -485,7 +444,7 @@ async def startup_event():
     
 
     logger.info("Vector Search Service initialized")
-    logger.info(f"Using Mistral service at: {MISTRAL_CONFIG['service_url']}")
+    logger.info(f"Using Mistral service at: {MISTRAL_CONFIG['chat_url']}")
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -507,7 +466,7 @@ async def get_search_service():
     return app.state.search_service
 
 # API Endpoints
-@app.post("/search")
+@app.post("/lexi-gen-ai/search")
 async def search(
     request: SearchRequest,
     search_service: VectorSearchService = Depends(get_search_service)
@@ -516,11 +475,22 @@ async def search(
     try:
         # Generate a request ID for this specific request
         request_id = str(uuid.uuid4())
-        logger.info(f"[{request_id}] Processing search request with query: {request.query}")
+        logger.info(f"[{request_id}] Processing search request with query: {request}")
+
+        if not request.language:
+            # Use your language detection logic here
+            detected_language = search_service.detect_best_language(request.query)
+            logger.info(f"detected_language : {detected_language}")
+            request.language = detected_language
+          
+
+
+
 
         responseData = await search_service.process_search_request(
             request.query,
             request.tenantId,
+            request.language,
             request.topK,
             request.threshold,
             request.metadataFilters,
@@ -557,8 +527,11 @@ async def search(
         answer  = responseData.get('answer', "Sorry, No details found.")
         
        
+        content_size = len(responseData.get("contents", []))
+        print(content_size)
+
         logger.info(f"[{request_id}] Search completed successfully")
-        return SearchResponse(result=answer, requestId=request_id)
+        return AISearchResultDto(result=answer, requestId=request_id, contentSize =content_size)
 
        
     except Exception as e:
@@ -586,7 +559,7 @@ async def health_check(search_service: VectorSearchService = Depends(get_search_
         try:
             # Simple ping to Mistral service
             response = await search_service.http_client.get(
-                    MISTRAL_CONFIG['service_url'].split('/v1')[0] + '/health',
+                    MISTRAL_CONFIG['version_url'],
                     timeout=5
             )
             mistral_healthy = response.status_code == 200
@@ -610,4 +583,4 @@ async def health_check(search_service: VectorSearchService = Depends(get_search_
 
 if __name__ == "__main__":
     # Use uvicorn with reload for development
-    uvicorn.run("master:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("master:app", host="0.0.0.0", port=9000, reload=True)
