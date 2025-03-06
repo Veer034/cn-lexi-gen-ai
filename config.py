@@ -14,7 +14,7 @@ ES_CONFIG = {
 
 KAFKA_CONFIG = {
     'bootstrap_servers': os.getenv('KAFKA_SERVERS', 'localhost:9092'),
-    'analytics_output_topic': os.getenv('DATA_EXTRACTOR_AI_ANALYTICS_TOPIC', 'lexi.gen.ai.analytics')
+    'analytics_output_topic': os.getenv('LEXI_GEN_AI_ANALYTICS_TOPIC', 'lexi.gen.ai.analytics')
 }
 
 MISTRAL_CONFIG = {
