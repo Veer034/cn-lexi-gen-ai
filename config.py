@@ -9,7 +9,7 @@ ES_CONFIG = {
     'hosts': ['http://localhost:9200'],
     'username': os.getenv('ES_USERNAME', ''),
     'password': os.getenv('ES_PASSWORD', ''),
-    'tenant_document_index_name': 'tenant-documents'
+    'tenant_document_index_name': 'tenant-documents-vector'
 }
 
 KAFKA_CONFIG = {

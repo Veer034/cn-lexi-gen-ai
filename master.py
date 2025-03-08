@@ -43,6 +43,7 @@ class SearchRequest(BaseModel):
 
 
 class AISearchResultDto(BaseModel):
+    isGreeting: bool
     result: str
     requestId: str
     contentSize: int
@@ -351,10 +352,11 @@ class VectorSearchService:
             content = message.get("content", "")
 
             search_result["answer"] = content
-            search_result["total_duration"] = mistral_response.get("total_duration", 0)
-            search_result["load_duration"] = mistral_response.get("load_duration", 0)
-            search_result["prompt_eval_duration"] = mistral_response.get("prompt_eval_duration", 0)
-            search_result["eval_duration"] = mistral_response.get("eval_duration", 0)
+             # Convert nanoseconds to seconds for better analytics readability
+            search_result["total_duration"] = mistral_response.get("total_duration", 0) / 1_000_000_000
+            search_result["load_duration"] = mistral_response.get("load_duration", 0) / 1_000_000_000
+            search_result["prompt_eval_duration"] = mistral_response.get("prompt_eval_duration", 0) / 1_000_000_000
+            search_result["eval_duration"] = mistral_response.get("eval_duration", 0) / 1_000_000_000
 
 
             logger.info(
@@ -423,6 +425,11 @@ class VectorSearchService:
         return 'en'
 
 
+    def get_best_response(self,language):
+        return self.manualDetector.get_no_results_message(language)
+
+    def handle_greeting(self, message, language):
+        return self.manualDetector.handle_greeting(message,language)
 
 
     async def close(self):
@@ -484,6 +491,12 @@ async def search(
             request.language = detected_language
           
 
+        greeting = search_service.handle_greeting(request.query,request.language)
+
+          # If greeting is detected, return the greeting response directly
+        if greeting:
+            logger.info(f"[{request_id}] Greeting detected, responding with appropriate greeting")
+            return AISearchResultDto(isGreeting = True,result=greeting, requestId=request_id, contentSize=0)
 
 
 
@@ -524,14 +537,16 @@ async def search(
             )
         
 
-        answer  = responseData.get('answer', "Sorry, No details found.")
-        
+        answer  = responseData.get('answer')
+        if answer == '':
+            language = request.language.lower()  # Get language from request
+            answer = search_service.get_best_response(language)
        
         content_size = len(responseData.get("contents", []))
         print(content_size)
 
         logger.info(f"[{request_id}] Search completed successfully")
-        return AISearchResultDto(result=answer, requestId=request_id, contentSize =content_size)
+        return AISearchResultDto(isGreeting =False, result=answer, requestId=request_id, contentSize =content_size)
 
        
     except Exception as e:
