@@ -162,7 +162,6 @@ class VectorSearchService:
         self, 
         embedding: List[float], 
         tenant_id: str, 
-        language: str,
         top_k: int = 5, 
         threshold: float = 0.55,
         metadata_filters: Optional[Dict[str, Any]] = None
@@ -171,7 +170,7 @@ class VectorSearchService:
         try:
             
             # Build the filter conditions
-            filter_conditions = [{"term": {"tenantId": tenant_id}}, {"term": {"metadata.language": language}}]
+            filter_conditions = [{"term": {"tenantId": tenant_id}}]
             
             # Add metadata filters if provided
             if metadata_filters:
@@ -224,8 +223,7 @@ class VectorSearchService:
         except Exception as e:
             logger.error(f"Error searching Elasticsearch: {str(e)}", exc_info=True)
             raise
-    
-
+  
     async def generate_answer_from_mistral(
         self,
         query: str,
@@ -233,7 +231,7 @@ class VectorSearchService:
         language: str,
         tone: str = "polite",
         max_length: int = 200,
-        ) -> Dict[str, Any]:
+    ) -> Dict[str, Any]:
         """
         Generate an answer to the query using LLM based strictly on the provided context
         
@@ -250,28 +248,42 @@ class VectorSearchService:
         try:
             # Combine contents into context
             context = "\n\n".join(contents)  # Direct join of string array
-    
+            
+            # Calculate an approximate token count (assuming ~4 chars per token on average)
+            # For a 25-30 word limit (approximately 35-45 tokens)
+            token_limit = min(max_length // 4, 45)  # Set upper bound to 45 tokens
+       
+
+            # Extract specific information if present
+            info_extraction_prompt = f"""
+            First, identify ALL specific facts, numbers, dates, limitations, and policy details in this context:
+            {context}
+            
+            List only the specific details found (timeframes, deadlines, rules, limits, etc.). Be concise.
+            """
+            
             # Strict system prompt to force context-only responses
             system_prompt = f"""CRITICAL INSTRUCTIONS:
             1. You MUST ONLY answer based on the EXACT provided context
-            2. If the answer CANNOT be found in the context, return an empty string ""
-            3. Use a {tone} but extremely concise tone
-            4. Keep your answer exact to the point
-            5. Never use generic phrases or add extra information
-            6. Do NOT rely on any previous knowledge or conversations
-            7. Your response must be strictly derived from the reference content
-            8. VERY IMPORTANT: Entire response MUST be under {max_length // 4} tokens"""
+            2. You MUST provide a BRIEF response - no more than {token_limit} tokens
+            3. Use a {tone} tone and be extremely concise
+            4. Only include the most essential details that directly answer the query
+            5. If the answer CANNOT be found in the context, respond with "Not provided in the context"
+            6. Do NOT add any explanations or information not present in the context
+            7. Do NOT exceed {token_limit} tokens in your response
+            8. Format your answer as a single paragraph with no bullet points or lists"""
             
             # User prompt emphasizing context-only response
-            user_prompt = f"""Reference content ONLY:
+            user_prompt = f"""Reference content:
             {context}
             
             Question: {query}
             
-            IMPORTANT: Provide ONLY an answer found EXACTLY in the given context in {language} language. 
-            If NO answer exists in the context, return an empty string."""
+            IMPORTANT: Provide a comprehensive answer based ONLY on information in the given context in {language} language.
+            Include ALL relevant policy details, time limits, conditions, or restrictions that apply to this question.
+            """
             
-            # Prepare the request payload
+            # Prepare the request payload - adjusting max_tokens
             data = {
                 "model": MISTRAL_CONFIG['model'],
                 "messages": [
@@ -279,7 +291,8 @@ class VectorSearchService:
                     {"role": "user", "content": user_prompt}
                 ],
                 "stream": False,
-                "max_tokens": max_length // 4
+                "max_tokens": max_length,  # Allow more tokens for a complete answer
+                "temperature": 0.2  # Lower temperature for more precise factual responses
             }
             
             # Log the request for debugging
@@ -307,7 +320,6 @@ class VectorSearchService:
         except Exception as e:
             logger.error(f"Error generating answer with LLM: {str(e)}", exc_info=True)
             return {"error": f"Error generating answer: {str(e)}"}
-             
 
     async def process_search_request(
         self, 
@@ -326,11 +338,14 @@ class VectorSearchService:
         # Generate embeddings for all queries
         embedding = await self.generate_embeddings(query)
         
+        metadata_filters={}
+        if language and language != "unknown":
+            metadata_filters["language"] = language
+                
         # Create tasks for concurrent Elasticsearch searches
         search_result = await self.search_elasticsearch(
                 embedding, 
                 tenant_id,
-                language, 
                 top_k, 
                 threshold,
                 metadata_filters
@@ -352,12 +367,11 @@ class VectorSearchService:
             content = message.get("content", "")
 
             search_result["answer"] = content
-             # Convert nanoseconds to seconds for better analytics readability
-            search_result["total_duration"] = mistral_response.get("total_duration", 0) / 1_000_000_000
-            search_result["load_duration"] = mistral_response.get("load_duration", 0) / 1_000_000_000
-            search_result["prompt_eval_duration"] = mistral_response.get("prompt_eval_duration", 0) / 1_000_000_000
-            search_result["eval_duration"] = mistral_response.get("eval_duration", 0) / 1_000_000_000
-
+            # Convert nanoseconds to milliseconds for better integer-based analytics
+            search_result["total_duration"] = int(mistral_response.get("total_duration", 0) / 1_000_000)  # nano to milli
+            search_result["load_duration"] = int(mistral_response.get("load_duration", 0) / 1_000_000)
+            search_result["prompt_eval_duration"] = int(mistral_response.get("prompt_eval_duration", 0) / 1_000_000)
+            search_result["eval_duration"] = int(mistral_response.get("eval_duration", 0) / 1_000_000)
 
             logger.info(
                 f"Processed search request for query: {query}, "
