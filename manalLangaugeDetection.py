@@ -11,12 +11,34 @@ logger = get_logger(__name__)
 
 class ManualLanguageDetector:
     def __init__(self):
-        self.setup_language_support()
-        self.setup_scripts()
-        self.setup_common_patterns()
-        self.setup_method_weights()
-        self.setup_noanswer_message()
-        self.setup_greeting_message()
+        logger.info("🔤 Initializing ManualLanguageDetector...")
+        
+        try:
+            self.setup_language_support()
+            logger.info("✅ Language support patterns loaded")
+            
+            self.setup_scripts()
+            logger.info("✅ Script detection patterns loaded")
+            
+            self.setup_common_patterns()
+            logger.info("✅ Common word patterns loaded")
+            
+            self.setup_method_weights()
+            logger.info("✅ Detection method weights configured")
+            
+            self.setup_noanswer_message()
+            logger.info("✅ No-answer messages loaded")
+            
+            self.setup_greeting_message()
+            logger.info("✅ Greeting patterns loaded")
+            
+            # Log configuration summary
+            logger.info(f"📊 Language detector configured for {len(getattr(self, 'supported_languages', {}))} languages")
+            logger.info("🎯 ManualLanguageDetector initialization completed")
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to initialize ManualLanguageDetector: {str(e)}", exc_info=True)
+            raise
         
     def setup_language_support(self):
         """Setup supported languages with their code, English name, and native name"""

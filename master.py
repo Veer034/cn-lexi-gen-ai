@@ -90,53 +90,61 @@ class AsyncKafkaProducer:
 
 class VectorSearchService:
     def __init__(self, model_path=None):
+        logger.info("🔧 Initializing VectorSearchService components...")
         # Initialize SentenceTransformer
         model_name = 'paraphrase-multilingual-mpnet-base-v2'
         # model_path = models_path or os.path.join(os.getcwd(), 'models', 'sentence_transformer')
         
         try:
             if model_path:
-                logger.info(f"Loading model from local path: {model_path}")
+                logger.info(f"📂 Loading model from local path: {model_path}")
                 self.st_model = SentenceTransformer(model_path)
+                logger.info("✅ Local model loaded successfully")
             else:
-                logger.info(f"Loading model {model_name} from Hugging Face")
+                logger.info(f"🌐 Loading model {model_name} from Hugging Face...")
                 self.st_model = SentenceTransformer(model_name)
+                logger.info("✅ Hugging Face model loaded successfully")
         except Exception as e:
-            logger.error(f"Error loading sentence transformer model: {e}")
+            logger.error(f"❌ Error loading sentence transformer model: {e}")
             raise
-            
-
         
         # Initialize async Elasticsearch client
+        logger.info("🔍 Initializing Elasticsearch client...")
         self.es_client = AsyncElasticsearch(
             ES_CONFIG['hosts'],
             basic_auth=(ES_CONFIG['username'], ES_CONFIG['password']),
             verify_certs=ES_CONFIG.get('verify_certs', True),
             ssl_show_warn=ES_CONFIG.get('ssl_show_warn', True),
-            ca_certs=ES_CONFIG.get('ca_certs'),  # Add this line
+            ca_certs=ES_CONFIG.get('ca_certs'),
             retry_on_timeout=True,
             max_retries=3
         )
+        logger.info("✅ Elasticsearch client initialized")
         
-         # TODO :: timeout need to be decreased to standard, 300 for local only
         # Initialize HTTP client for API calls
+        logger.info("🌐 Initializing HTTP client...")
         self.http_client = httpx.AsyncClient(timeout=300.0)
+        logger.info("✅ HTTP client initialized")
         
         # Initialize Kafka producer for async processing results
+        logger.info("📨 Initializing Kafka producer...")
         try:
             self.producer = AsyncKafkaProducer(KAFKA_CONFIG['bootstrap_servers'])
-            logger.info("Kafka producer initialized successfully")
+            logger.info("✅ Kafka producer initialized successfully")
         except Exception as e:
-            logger.warning(f"Failed to initialize Kafka producer: {str(e)}")
+            logger.warning(f"⚠️  Failed to initialize Kafka producer: {str(e)}")
             self.producer = None
+        
+        # Initialize detectors
+        logger.info("🔤 Initializing language detectors...")
+        self.manualDetector = ManualLanguageDetector()
+        self.libraryDetector = LibraryLanguageDetector()
+        logger.info("✅ Language detectors initialized")
         
         # Create a pool of workers for CPU-bound tasks
         self.process_pool = None
-
-
-        # Create detector
-        self.manualDetector = ManualLanguageDetector()
-        self.libraryDetector = LibraryLanguageDetector()
+        
+        logger.info("🎯 VectorSearchService initialization completed!")
 
 
     
@@ -464,12 +472,70 @@ class VectorSearchService:
 # Service dependency
 @app.on_event("startup")
 async def startup_event():
-    # Initialize the search service
-    app.state.search_service = VectorSearchService()
-    
-
-    logger.info("Vector Search Service initialized")
-    logger.info(f"Using Mistral service at: {MISTRAL_CONFIG['chat_url']}")
+    try:
+        logger.info("=" * 60)
+        logger.info("🚀 STARTING VECTOR SEARCH SERVICE")
+        logger.info("=" * 60)
+        
+        # Initialize the search service
+        logger.info("📦 Initializing Vector Search Service...")
+        app.state.search_service = VectorSearchService()
+        logger.info("✅ Vector Search Service initialized successfully")
+        
+        # Log configuration details
+        logger.info(f"🔧 Mistral service configured at: {MISTRAL_CONFIG['chat_url']}")
+        logger.info(f"🔧 Elasticsearch configured at: {ES_CONFIG['hosts']}")
+        logger.info(f"🔧 Kafka configured at: {KAFKA_CONFIG['bootstrap_servers']}")
+        
+        # Perform initial health checks
+        logger.info("🏥 Performing initial health checks...")
+        
+        # Check Elasticsearch
+        try:
+            es_healthy = await app.state.search_service.es_client.ping()
+            if es_healthy:
+                logger.info("✅ Elasticsearch connection: HEALTHY")
+            else:
+                logger.warning("⚠️  Elasticsearch connection: FAILED")
+        except Exception as e:
+            logger.error(f"❌ Elasticsearch connection error: {str(e)}")
+        
+        # Check Mistral service
+        try:
+            response = await app.state.search_service.http_client.get(
+                MISTRAL_CONFIG['version_url'],
+                timeout=5
+            )
+            if response.status_code == 200:
+                logger.info("✅ Mistral service connection: HEALTHY")
+            else:
+                logger.warning(f"⚠️  Mistral service responded with status: {response.status_code}")
+        except Exception as e:
+            logger.warning(f"⚠️  Mistral service connection: {str(e)}")
+        
+        # Check model loading
+        if hasattr(app.state.search_service, 'st_model'):
+            logger.info("✅ Sentence Transformer model: LOADED")
+        else:
+            logger.error("❌ Sentence Transformer model: FAILED TO LOAD")
+        
+        # Check Kafka producer
+        if app.state.search_service.producer and app.state.search_service.producer.is_connected:
+            logger.info("✅ Kafka producer: CONNECTED")
+        else:
+            logger.warning("⚠️  Kafka producer: NOT CONNECTED")
+        
+        logger.info("=" * 60)
+        logger.info("🎉 VECTOR SEARCH SERVICE STARTED SUCCESSFULLY")
+        logger.info("🌐 Service is ready to accept requests on port 9001")
+        logger.info("📍 Health check available at: http://localhost:9001/health")
+        logger.info("📍 Search endpoint available at: http://localhost:9001/lexi-gen-ai/search")
+        logger.info("=" * 60)
+        
+    except Exception as e:
+        logger.error("💥 STARTUP FAILED!")
+        logger.error(f"❌ Error during startup: {str(e)}", exc_info=True)
+        raise
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -579,41 +645,110 @@ async def search(
 
 @app.get("/health")
 async def health_check(search_service: VectorSearchService = Depends(get_search_service)):
-    """Health check endpoint"""
+    """Enhanced health check endpoint with detailed logging"""
+    health_check_id = str(uuid.uuid4())[:8]
+    logger.info(f"🏥 [{health_check_id}] Health check requested")
+    
     try:
-        # Check Elasticsearch connection asynchronously
-        es_healthy = await search_service.es_client.ping()
-        
-        # Check model loaded
-        model_healthy = hasattr(search_service, 'st_model')
-        
-        # Check Mistral service connection asynchronously
-        mistral_healthy = False
-        try:
-            # Simple ping to Mistral service
-            response = await search_service.http_client.get(
-                    MISTRAL_CONFIG['version_url'],
-                    timeout=5
-            )
-            mistral_healthy = response.status_code == 200
-        except Exception as e:
-            logger.warning(f"Mistral service health check failed: {str(e)}")
-        
-        # Create response
-        status = {
-            "status": "healthy" if (es_healthy and model_healthy) else "unhealthy",
-            "elasticsearch": es_healthy,
-            "model": model_healthy,
-            "mistral": mistral_healthy
+        health_status = {
+            "timestamp": datetime.datetime.now().isoformat(),
+            "service": "Vector Search Service",
+            "version": "1.0.0",
+            "status": "unknown",
+            "components": {}
         }
         
-        if not (es_healthy and model_healthy):
-            raise HTTPException(status_code=503, detail=status)
+        # Check Elasticsearch connection
+        logger.info(f"🔍 [{health_check_id}] Checking Elasticsearch connection...")
+        try:
+            es_healthy = await search_service.es_client.ping()
+            health_status["components"]["elasticsearch"] = {
+                "status": "healthy" if es_healthy else "unhealthy",
+                "hosts": ES_CONFIG['hosts']
+            }
+            logger.info(f"✅ [{health_check_id}] Elasticsearch: {'HEALTHY' if es_healthy else 'UNHEALTHY'}")
+        except Exception as e:
+            health_status["components"]["elasticsearch"] = {
+                "status": "unhealthy",
+                "error": str(e)
+            }
+            logger.error(f"❌ [{health_check_id}] Elasticsearch check failed: {str(e)}")
+            es_healthy = False
+        
+        # Check model loaded
+        logger.info(f"🤖 [{health_check_id}] Checking model status...")
+        model_healthy = hasattr(search_service, 'st_model') and search_service.st_model is not None
+        health_status["components"]["sentence_transformer"] = {
+            "status": "healthy" if model_healthy else "unhealthy"
+        }
+        logger.info(f"✅ [{health_check_id}] Model: {'LOADED' if model_healthy else 'NOT LOADED'}")
+        
+        # Check Mistral service connection
+        logger.info(f"🧠 [{health_check_id}] Checking Mistral service connection...")
+        mistral_healthy = False
+        try:
+            response = await search_service.http_client.get(
+                MISTRAL_CONFIG['version_url'],
+                timeout=5
+            )
+            mistral_healthy = response.status_code == 200
+            health_status["components"]["mistral_service"] = {
+                "status": "healthy" if mistral_healthy else "unhealthy",
+                "url": MISTRAL_CONFIG['version_url'],
+                "response_code": response.status_code
+            }
+            logger.info(f"✅ [{health_check_id}] Mistral service: {'HEALTHY' if mistral_healthy else 'UNHEALTHY'}")
+        except Exception as e:
+            health_status["components"]["mistral_service"] = {
+                "status": "unhealthy",
+                "error": str(e)
+            }
+            logger.warning(f"⚠️  [{health_check_id}] Mistral service check failed: {str(e)}")
+        
+        # Check Kafka producer
+        logger.info(f"📨 [{health_check_id}] Checking Kafka producer...")
+        kafka_healthy = (search_service.producer is not None and 
+                        hasattr(search_service.producer, 'is_connected') and 
+                        search_service.producer.is_connected)
+        health_status["components"]["kafka_producer"] = {
+            "status": "healthy" if kafka_healthy else "unhealthy",
+            "bootstrap_servers": KAFKA_CONFIG['bootstrap_servers']
+        }
+        logger.info(f"✅ [{health_check_id}] Kafka producer: {'CONNECTED' if kafka_healthy else 'DISCONNECTED'}")
+        
+        # Overall health status
+        overall_healthy = es_healthy and model_healthy
+        health_status["status"] = "healthy" if overall_healthy else "unhealthy"
+        
+        # Log overall result
+        if overall_healthy:
+            logger.info(f"🎉 [{health_check_id}] Overall health check: PASSED")
+        else:
+            logger.warning(f"⚠️  [{health_check_id}] Overall health check: FAILED")
+        
+        # Return appropriate response
+        if not overall_healthy:
+            raise HTTPException(status_code=503, detail=health_status)
             
-        return status
+        return health_status
+        
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        logger.error(f"💥 [{health_check_id}] Health check error: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=503, detail={
+            "status": "unhealthy",
+            "error": str(e),
+            "timestamp": datetime.datetime.now().isoformat()
+        })
 
 if __name__ == "__main__":
+    logger.info("🚀 Starting application with uvicorn...")
+    logger.info("📋 Configuration:")
+    logger.info(f"   - Host: 0.0.0.0")
+    logger.info(f"   - Port: 9001")
+    logger.info(f"   - Reload: True")
+    logger.info("🔄 Starting uvicorn server...")
+    
     # Use uvicorn with reload for development
     uvicorn.run("master:app", host="0.0.0.0", port=9001, reload=True)
