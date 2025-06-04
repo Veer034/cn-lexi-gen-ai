@@ -22,12 +22,9 @@ from pythonjsonlogger import jsonlogger
 from response import ExtractionAnalyticsDto
 from manalLangaugeDetection import ManualLanguageDetector
 from libaryLanguage import LibraryLanguageDetector
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s"
-)
-logger = logging.getLogger(__name__)
+
+from logger_config import get_logger
+logger = get_logger(__name__)
 
 
 # Define request and response models
@@ -92,19 +89,23 @@ class AsyncKafkaProducer:
             self.is_connected = False
 
 class VectorSearchService:
-    def __init__(self, models_path=None):
+    def __init__(self, model_path=None):
         # Initialize SentenceTransformer
         model_name = 'paraphrase-multilingual-mpnet-base-v2'
-        model_path = models_path or os.path.join(os.getcwd(), 'models', 'sentence_transformer')
+        # model_path = models_path or os.path.join(os.getcwd(), 'models', 'sentence_transformer')
         
+        try:
+            if model_path:
+                logger.info(f"Loading model from local path: {model_path}")
+                self.st_model = SentenceTransformer(model_path)
+            else:
+                logger.info(f"Loading model {model_name} from Hugging Face")
+                self.st_model = SentenceTransformer(model_name)
+        except Exception as e:
+            logger.error(f"Error loading sentence transformer model: {e}")
+            raise
+            
 
-        # Use downloaded model if available, otherwise use the model name directly
-        if os.path.exists(model_path):
-            logger.info(f"Loading model from local path: {model_path}")
-            self.st_model = SentenceTransformer(model_path)
-        else:
-            logger.info(f"Local model not found. Loading model {model_name} from Hugging Face")
-            self.st_model = SentenceTransformer(model_name)
         
         # Initialize Async Elasticsearch client
         self.es_client = AsyncElasticsearch(
@@ -612,4 +613,4 @@ async def health_check(search_service: VectorSearchService = Depends(get_search_
 
 if __name__ == "__main__":
     # Use uvicorn with reload for development
-    uvicorn.run("master:app", host="0.0.0.0", port=9000, reload=True)
+    uvicorn.run("master:app", host="0.0.0.0", port=9001, reload=True)

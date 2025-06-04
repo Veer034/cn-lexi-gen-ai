@@ -1,3 +1,7 @@
+About
+
+    LexiGen(Lexicon + Generation) AI understands language, retrieves relevant information, and generates responses based on stored knowledge, making it ideal for AI-powered document search and answer generation.
+
 Remove docker images
 
     docker-compose down
@@ -36,7 +40,7 @@ Install library in local VM
     pip install "numpy<2.0.0"  sentence-transformers torch elasticsearch confluent-kafka httpx aiohttp python-json-logger transformers python-dotenv nltk langdetect fastapi uvicorn gunicorn pydantic asyncio  fasttext regex
 
     #For language detection
-    pip install langdetect fasttext lingua-language-detector pycld2 polyglot pyicu morfessor
+    pip install langdetect fasttext lingua-language-detector pycld2 polyglot
 
 Start in local
 
@@ -45,6 +49,145 @@ Start in local
 deactivate your virtual environment if it's active:
 
     deactivate
+
+# Production Setup
+
+### Login VM
+
+    ssh azureuser@YOUR-VM-PUBLIC-IP
+
+### Install Git
+
+    sudo apt update
+    sudo apt install git -y
+    git clone https://github.com/Veer034/cn-lexi-gen-ai.git
+
+### Install Python
+
+    sudo add-apt-repository ppa:deadsnakes/ppa -y
+    sudo apt update
+    sudo apt install python3.10 python3.10-venv python3.10-distutils
+
+### Install library in production VM
+
+    pip install "numpy<2.0.0"  sentence-transformers torch elasticsearch confluent-kafka httpx aiohttp python-json-logger transformers python-dotenv nltk langdetect fastapi uvicorn gunicorn pydantic asyncio  fasttext regex
+
+    # Install all required build tools and dependencies for language libraries
+    sudo apt update
+    sudo apt install -y \
+        build-essential \
+        g++ \
+        gcc \
+        python3-dev \
+        libicu-dev \
+        pkg-config \
+        cmake \
+        make \
+        git \
+        libc6-dev \
+        linux-headers-generic
+
+    # Install additional tools that FastText needs
+    sudo apt install -y \
+        software-properties-common \
+        apt-transport-https \
+        ca-certificates \
+        gnupg \
+        lsb-release
+
+    # Check current GCC version
+    gcc --version
+
+    # If GCC is older than 7.x, update it
+    sudo apt install -y gcc-9 g++-9
+    sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-9 60
+    sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-9 60
+
+    # Ensure pip build tools are up to date
+    pip install --upgrade pip setuptools wheel
+    pip install --upgrade build
+
+    #For language detection
+    pip install langdetect fasttext lingua-language-detector pycld2 polyglot
+
+### Create Systemd file for as a service execution
+
+    sudo tee /etc/systemd/system/cn-lexi-gen-ai.service > /dev/null << EOF
+    [Unit]
+    Description=For data forging
+    After=network.target ollama.service
+    Requires=ollama.service
+
+    [Service]
+    Type=simple
+    User=azureuser
+    WorkingDirectory=/home/azureuser/cn-lexi-gen-ai
+    Environment=PATH=/home/azureuser/cn-lexi-gen-ai/myvenv/bin
+    ExecStart=/home/azureuser/cn-lexi-gen-ai/myvenv/bin/python master.py
+    Restart=always
+    RestartSec=10
+    StandardOutput=journal
+    StandardError=journal
+
+    [Install]
+    WantedBy=multi-user.target
+    EOF
+
+### HuggingFace model storage location
+
+    ~/.cache/huggingface/
+
+### Reload systemd
+
+    sudo systemctl daemon-reload
+
+### Enable all services to start on boot
+
+    sudo systemctl enable cn-lexi-gen-ai
+
+### Start Service
+
+    sudo systemctl start cn-lexi-gen-ai
+
+### Check Status
+
+    sudo systemctl status cn-lexi-gen-ai
+
+### Stop service
+
+    sudo systemctl stop cn-lexi-gen-ai
+
+### Restart service
+
+    sudo systemctl restart cn-lexi-gen-ai
+
+### Check logs for specific service
+
+    sudo journalctl -u cn-lexi-gen-ai -f
+
+### Check service generated logs
+
+    tail -n 50 ~/cn-lexi-gen-ai/logs/server.log
+
+### List all topics
+
+kafka-topics.sh --list --bootstrap-server 57.159.53.43:9092
+
+### Create a specific topic
+
+kafka-topics.sh --create --topic my-topic --bootstrap-server 57.159.53.43:9092
+
+### Describe a specific topic
+
+kafka-topics.sh --describe --topic tenant.documents.vector.storage.request --bootstrap-server 57.159.53.43:9092
+
+### Describe all topics
+
+kafka-topics.sh --describe --bootstrap-server 57.159.53.43:9092
+
+### Describe multiple specific topics
+
+kafka-topics.sh --describe --topic tenant.documents.vector.storage.request,tenant.faq.vector.storage.request --bootstrap-server 57.159.53.43:9092
 
 command to extract chat response:
 

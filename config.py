@@ -6,14 +6,19 @@ load_dotenv()
 
 # Config (can be moved to separate file)
 ES_CONFIG = {
-    'hosts': ['http://localhost:9200'],
-    'username': os.getenv('ES_USERNAME', ''),
-    'password': os.getenv('ES_PASSWORD', ''),
-    'tenant_document_index_name': 'tenant-documents-vector'
+    'hosts': [
+        f"https://{host.strip()}" for host in os.getenv('ES_HOSTS', 'localhost:9200').split(",")
+    ],
+    'username': os.getenv('ES_USERNAME',''),
+    'password': os.getenv('ES_PASSWORD',''),
+    'ca_certs': '/usr/local/share/ca-certificates/elasticsearch.crt',  # Point to certificate file
+    'verify_certs': True,
+    'ssl_show_warn': False,
+    'tenant_document_index_name': os.getenv('ES_TENANT_DOCUMENTS_VECTOR_INDEX_NAME', 'tenant-documents-vector')
 }
 
 KAFKA_CONFIG = {
-    'bootstrap_servers': os.getenv('KAFKA_SERVERS', 'localhost:9092'),
+    'bootstrap_servers': os.getenv('KAFKA_BOOTSTRAP_SERVERS', 'localhost:9092'),
     'analytics_output_topic': os.getenv('LEXI_GEN_AI_ANALYTICS_TOPIC', 'lexi.gen.ai.analytics')
 }
 

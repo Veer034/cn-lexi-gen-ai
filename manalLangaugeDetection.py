@@ -6,7 +6,8 @@ from collections import Counter
 import logging
 import os
 
-logger = logging.getLogger(__name__)
+from logger_config import get_logger
+logger = get_logger(__name__)
 
 class ManualLanguageDetector:
     def __init__(self):
