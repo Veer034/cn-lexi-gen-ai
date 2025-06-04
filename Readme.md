@@ -191,7 +191,7 @@ kafka-topics.sh --describe --topic tenant.documents.vector.storage.request,tenan
 
 command to extract chat response:
 
-    curl -X POST http://localhost:8000/search \
+    curl -X GET http://localhost:9001/search \
     -H "Content-Type: application/json" \
     -d '{
         "queries": [
@@ -210,3 +210,7 @@ command to extract chat response:
         "answer_tone": "professional",
         "max_answer_length": 350
     }'
+
+Command for health check
+
+    curl -X GET http://localhost:9001/health
