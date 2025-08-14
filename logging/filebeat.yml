@@ -10,6 +10,10 @@ filebeat.inputs:
     multiline.pattern: '^\d{4}-\d{2}-\d{2}'
     multiline.negate: true
     multiline.match: after
+    # Add fields to identify the source
+    fields:
+      input_type: "application_logs"
+    fields_under_root: true
 
   - type: journald
     id: journald-services
@@ -18,7 +22,11 @@ filebeat.inputs:
       - "SYSTEMD_UNIT=cn-lexi-gen-ai.service"
       - "SYSTEMD_UNIT=cn-data-forge-ai.service"
       - "SYSTEMD_UNIT=cn-lexi-mail-ai.service"
-setup.template.name: "logs"
+    fields:
+      input_type: "systemd_logs"
+    fields_under_root: true
+
+setup.template.name: "ai-service-logs"
 setup.template.pattern: "ai-service-logs-*"
 setup.template.settings:
   index.number_of_shards: 1
@@ -28,52 +36,98 @@ setup.template.settings:
   index.mapping.coerce: false
 
 processors:
-  # 1️⃣ Extract service name from systemd.unit without the ".service" suffix
+  # Extract service name and tracking_id, set index name
   - script:
       lang: javascript
-      id: set-service-logs-index-and-id
+      id: process-logs-and-set-metadata
       source: >
         function process(event) {
           try {
-            // === 1. Extract service name without ".service" ===
-            var unit = event.Get("systemd.unit") || "";
-            var serviceName = unit.replace(/\.service$/, "");
-            event.Put("service_name", serviceName);
-
-            // === 2. Create monthly index name ===
+            // === 1. Create monthly index name ===
             var now = new Date();
             var year = now.getFullYear();
             var month = (now.getMonth() + 1) < 10 ? "0" + (now.getMonth() + 1) : "" + (now.getMonth() + 1);
-            var date = year + "-" + month;
-
-            if (!event.Get("@metadata.index")) {
-              event.Put("@metadata.index", "ai-service-logs-" + date);
+            var indexName = "ai-service-logs-" + year + "-" + month;
+            
+            var serviceName = "unknown";
+            var trackingId = "NA";
+            
+            // === 2. Extract service name from file path or systemd unit ===
+            var inputType = event.Get("input_type") || "unknown";
+            
+            if (inputType === "application_logs") {
+              // For file-based logs, extract from path
+              var logFilePath = event.Get("log.file.path") || "";
+              if (logFilePath.indexOf("cn-lexi-mail-ai") !== -1) {
+                serviceName = "cn-lexi-mail-ai";
+              } else if (logFilePath.indexOf("cn-lexi-gen-ai") !== -1) {
+                serviceName = "cn-lexi-gen-ai";
+              } else if (logFilePath.indexOf("cn-data-forge-ai") !== -1) {
+                serviceName = "cn-data-forge-ai";
+              }
             }
-
-            // === 3. Create document ID ===
-            var podName = event.Get("kubernetes.pod.name");
-            var logTimestamp = event.Get("log_timestamp") || event.Get("@timestamp");
-            var logOffset = event.Get("log.offset");
-
-            var documentId = "";
-            if (serviceName && logTimestamp) {
-              var baseString = serviceName + "_" + (podName || "unknown") + "_" + logTimestamp + "_" + logOffset;
-              documentId = baseString.replace(/[^a-zA-Z0-9_-]/g, '').substring(0, 64);
-              event.Put("@metadata.id", documentId);
+            } else if (inputType === "systemd_logs") {
+              // For systemd logs, extract from systemd.unit
+              var unit = event.Get("systemd.unit") || "";
+              serviceName = unit.replace(/\.service$/, "");
             }
-
+            
+            // === 3. Extract tracking_id from log message ===
+            var message = event.Get("message") || "";
+            
+            // Multiple patterns to match tracking_id based on your log format
+            // Pattern 1: [tracking_id] in square brackets (most common)
+            var trackingMatch = message.match(/\[([a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12})\]/);
+            if (trackingMatch) {
+              trackingId = trackingMatch[1];
+            } else {
+              // Pattern 2: tracking_id=value or tracking_id:value
+              var trackingMatch2 = message.match(/tracking_id[=:]\s*([a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12})/);
+              if (trackingMatch2) {
+                trackingId = trackingMatch2[1];
+              } else {
+                // Pattern 3: Look for any UUID-like pattern in the message
+                var uuidMatch = message.match(/([a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12})/);
+                if (uuidMatch) {
+                  trackingId = uuidMatch[1];
+                }
+              }
+            }
+            
+            // === 4. Set metadata ===
+            event.Put("service_name", serviceName);
+            event.Put("tracking_id", trackingId);
+            event.Put("@metadata.index", indexName);
+            
+            // === 5. Create document ID ===
+            var timestamp = event.Get("@timestamp");
+            var logOffset = event.Get("log.offset") || Math.floor(Math.random() * 1000000);
+            var documentId = serviceName + "_" + trackingId + "_" + timestamp + "_" + logOffset;
+            documentId = documentId.replace(/[^a-zA-Z0-9_-]/g, '_').substring(0, 64);
+            event.Put("@metadata.id", documentId);
+            
           } catch (e) {
-              var now = new Date();
+            // Fallback on error
+            var now = new Date();
             var year = now.getFullYear();
             var month = (now.getMonth() + 1) < 10 ? "0" + (now.getMonth() + 1) : "" + (now.getMonth() + 1);
-            var date = year + "-" + month;
-
-            // On error, default index and skip doc ID
-            event.Put("@metadata.index", "ai-service-logs-" + date);
+            var fallbackIndex = "ai-service-logs-" + year + "-" + month;
+            
+            event.Put("@metadata.index", fallbackIndex);
+            event.Put("service_name", "unknown");
+            event.Put("tracking_id", "NA");
           }
         }
 
-# Keep your existing AKS Elasticsearch output
+  # Add timestamp for better sorting and querying
+  - timestamp:
+      field: "@timestamp"
+      layouts:
+        - "2006-01-02T15:04:05.000Z"
+        - "2006-01-02 15:04:05"
+      test:
+        - "2025-08-14T20:27:20.516Z"
+
 output.elasticsearch:
   hosts:
     ["https://10.0.0.4:9200", "https://10.0.0.5:9200", "https://10.0.0.6:9200"]
@@ -91,3 +145,12 @@ output.elasticsearch:
   max_retries: 5
   backoff.init: 1s
   backoff.max: 60s
+
+# Optional: Configure logging level
+logging.level: info
+logging.to_files: true
+logging.files:
+  path: /var/log/filebeat
+  name: filebeat
+  keepfiles: 7
+  permissions: 0644
