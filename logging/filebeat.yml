@@ -25,14 +25,9 @@ filebeat.inputs:
       input_type: "systemd_logs"
     fields_under_root: true
 
-setup.template.name: "ai-service-logs"
-setup.template.pattern: "ai-service-logs-*"
-setup.template.settings:
-  index.number_of_shards: 1
-  index.number_of_replicas: 0
-  index.refresh_interval: "5s"
-  index.mapping.ignore_malformed: true
-  index.mapping.coerce: false
+setup.template.name: ""
+setup.template.pattern: ""
+setup.template.enabled: false
 
 processors:
   - script:
@@ -42,10 +37,7 @@ processors:
         function process(event) {
           var serviceName = "unknown";
           var trackingId = "NA";
-          var now = new Date();
-          var year = now.getFullYear();
-          var month = (now.getMonth() + 1) < 10 ? "0" + (now.getMonth() + 1) : "" + (now.getMonth() + 1);
-          var indexName = "ai-service-logs-" + year + "-" + month;
+          var indexName = "ai-service-logs";
           
           var inputType = event.Get("input_type") || "unknown";
           if (inputType === "application_logs") {
@@ -73,11 +65,42 @@ processors:
             }
           }
           
+          var logLevel = "UNKNOWN";
+          var originalMessage = event.Get("message");
+          if (originalMessage) {
+            // Try common log level keywords anywhere in the string
+            var levelMatch = originalMessage.match(/(?:^|\s)(DEBUG|INFO|WARN|ERROR|TRACE|FATAL)(?:\s|:)/i);
+            if (levelMatch) {
+              logLevel = levelMatch[1];
+            }
+          }
+
+          if (logLevel) {
+            var cleanLogLevel = logLevel.trim().toUpperCase();
+            // Extract valid log levels (INFO, DEBUG, WARN, ERROR, TRACE, FATAL)
+            var validLevels = ["INFO", "DEBUG", "WARN", "ERROR", "TRACE", "FATAL"];
+            for (var i = 0; i < validLevels.length; i++) {
+              if (cleanLogLevel.indexOf(validLevels[i]) !== -1) {
+                event.Put("log_level", validLevels[i]);
+                break;
+              }
+            }
+          }
+
+          var originalMsg = event.Get("message");
+          
           event.Put("service_name", serviceName);
           event.Put("tracking_id", trackingId);
+          event.Put("log_message", originalMsg);
+          
           event.Put("@metadata.index", indexName);
+          event.Delete("@metadata._index");
+          event.Delete("@metadata.beat");
+          event.Delete("@metadata.type");
+          event.Delete("@metadata.version");
         }
-
+  - drop_fields:
+      fields: ["message"]
 output.elasticsearch:
   hosts:
     - "https://10.0.0.4:9200"
@@ -90,6 +113,10 @@ output.elasticsearch:
       - "/usr/local/share/ca-certificates/elasticsearch.crt"
     verification_mode: certificate
   index: "%{[@metadata.index]}"
+  template.name: ""
+  template.pattern: ""
+  template.enabled: false
+  ilm.enabled: false
   loadbalance: true
   worker: 1
   bulk_max_size: 500
