@@ -16,13 +16,19 @@ setup.template.settings:
   index.mapping.coerce: false
 
 processors:
+  # 1️⃣ Extract service name from systemd.unit without the ".service" suffix
   - script:
       lang: javascript
       id: set-service-logs-index-and-id
       source: >
         function process(event) {
           try {
-            // === 1. Create monthly index name ===
+            // === 1. Extract service name without ".service" ===
+            var unit = event.Get("systemd.unit") || "";
+            var serviceName = unit.replace(/\.service$/, "");
+            event.Put("service_name", serviceName);
+
+            // === 2. Create monthly index name ===
             var now = new Date();
             var year = now.getFullYear();
             var month = (now.getMonth() + 1) < 10 ? "0" + (now.getMonth() + 1) : "" + (now.getMonth() + 1);
@@ -32,8 +38,7 @@ processors:
               event.Put("@metadata.index", "service-logs-" + fallbackDate);
             }
 
-            // === 2. Create document ID ===
-            var serviceName = event.Get("service_name");
+            // === 3. Create document ID ===
             var podName = event.Get("kubernetes.pod.name");
             var logTimestamp = event.Get("log_timestamp") || event.Get("@timestamp");
             var logOffset = event.Get("log.offset");
