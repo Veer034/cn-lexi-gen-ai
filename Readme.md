@@ -126,6 +126,7 @@ deactivate your virtual environment if it's active:
     ExecStart=/home/azureuser/cn-lexi-gen-ai/myvenv/bin/python master.py
     Restart=always
     RestartSec=10
+    StartLimitIntervalSec=0
     StandardOutput=journal
     StandardError=journal
 
@@ -136,6 +137,11 @@ deactivate your virtual environment if it's active:
 ### HuggingFace model storage location
 
     ~/.cache/huggingface/
+
+### List all services
+
+    systemctl list-units --type=service
+    systemctl list-units --type=service | grep cn-
 
 ### Reload systemd
 
@@ -168,6 +174,22 @@ deactivate your virtual environment if it's active:
 ### Check service generated logs
 
     tail -n 50 ~/cn-lexi-gen-ai/logs/server.log
+
+### Check logs for that service
+
+    journalctl -u cn-lexi-gen-ai.service
+
+### Rotate the journal for that service (so old logs can be vacuumed)
+
+    sudo journalctl --unit=cn-lexi-gen-ai.service --rotate
+
+### Delete old logs for that service
+
+    sudo journalctl --unit=cn-lexi-gen-ai.service --vacuum-time=1s
+
+
+    # Or to keep only the last 7 days:
+    sudo journalctl --unit=cn-lexi-gen-ai.service --vacuum-time=7d
 
 ### List all topics
 

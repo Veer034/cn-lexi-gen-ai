@@ -1,0 +1,70 @@
+filebeat.inputs:
+  - type: journald
+    id: journald-services
+    include_matches:
+      - "SYSTEMD_UNIT=ollama.service"
+      - "SYSTEMD_UNIT=cn-lexi-gen-ai.service"
+      - "SYSTEMD_UNIT=cn-data-forge-ai.service"
+      - "SYSTEMD_UNIT=cn-lexi-mail-ai.service"
+setup.template.name: "logs"
+setup.template.pattern: "service-logs-*,infra-logs-*"
+setup.template.settings:
+  index.number_of_shards: 1
+  index.number_of_replicas: 0
+  index.refresh_interval: "5s"
+  index.mapping.ignore_malformed: true
+  index.mapping.coerce: false
+
+processors:
+  - script:
+      lang: javascript
+      id: set-service-logs-index-and-id
+      source: >
+        function process(event) {
+          try {
+            // === 1. Create monthly index name ===
+            var now = new Date();
+            var year = now.getFullYear();
+            var month = (now.getMonth() + 1) < 10 ? "0" + (now.getMonth() + 1) : "" + (now.getMonth() + 1);
+            var fallbackDate = year + "-" + month;
+
+            if (!event.Get("@metadata.index")) {
+              event.Put("@metadata.index", "service-logs-" + fallbackDate);
+            }
+
+            // === 2. Create document ID ===
+            var serviceName = event.Get("service_name");
+            var podName = event.Get("kubernetes.pod.name");
+            var logTimestamp = event.Get("log_timestamp") || event.Get("@timestamp");
+            var logOffset = event.Get("log.offset");
+
+            var documentId = "";
+            if (serviceName && logTimestamp) {
+              var baseString = serviceName + "_" + (podName || "unknown") + "_" + logTimestamp + "_" + logOffset;
+              documentId = baseString.replace(/[^a-zA-Z0-9_-]/g, '').substring(0, 64);
+              event.Put("@metadata.id", documentId);
+            }
+
+          } catch (e) {
+            // On error, default index and skip doc ID
+            event.Put("@metadata.index", "service-logs-fallback");
+          }
+        }
+
+# Keep your existing AKS Elasticsearch output
+output.elasticsearch:
+  hosts:
+    ["https://10.0.0.4:9200", "https://10.0.0.5:9200", "https://10.0.0.6:9200"]
+  username: "filebeat_writer"
+  password: "filebeat@2025"
+  ssl:
+    certificate_authorities: ["/etc/ssl/certs/ca.crt"]
+    verification_mode: certificate
+  index: "%{[@metadata.index]}"
+  document_id: "%{[@metadata][id]}"
+  loadbalance: true
+  worker: 1
+  bulk_max_size: 500
+  max_retries: 5
+  backoff.init: 1s
+  backoff.max: 60s

@@ -8,23 +8,33 @@ from typing import List, Dict, Any, Optional
 import asyncio
 import numpy as np
 
-from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, HTTPException, Depends, Request
+from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
 from elasticsearch import AsyncElasticsearch
 from confluent_kafka import Producer
-from confluent_kafka.admin import AdminClient, NewTopic
-from confluent_kafka import Consumer, KafkaError, KafkaException
 import httpx
 from config import KAFKA_CONFIG, ES_CONFIG, MISTRAL_CONFIG
 from pythonjsonlogger import jsonlogger
 from response import ExtractionAnalyticsDto
 from manalLangaugeDetection import ManualLanguageDetector
 from libaryLanguage import LibraryLanguageDetector
+from logger_config import tracking_id_var, get_logger
 
 from logger_config import get_logger
 logger = get_logger(__name__)
+
+# Initialize app
+app = FastAPI(title="Vector Search Service")
+
+
+# For Getting trackingId
+@app.middleware("http")
+async def add_tracking_id_middleware(request: Request, call_next):
+    tracking_id = request.headers.get("trackingId", "NA")
+    tracking_id_var.set(tracking_id)
+    response = await call_next(request)
+    return response
 
 
 # Define request and response models
@@ -46,8 +56,7 @@ class AISearchResultDto(BaseModel):
     contentSize: int
 
 
-# Initialize app
-app = FastAPI(title="Vector Search Service")
+
 
 
 
@@ -74,8 +83,9 @@ class AsyncKafkaProducer:
                 
             if key is not None and not isinstance(key, bytes):
                 key = str(key).encode('utf-8')
-                
-            self.producer.produce(topic, key=key, value=value, callback=callback)
+            
+            tracking_id = tracking_id_var.get() or "NA"
+            self.producer.produce(topic, key=key, value=value, callback=callback,  headers=[("trackingId", tracking_id.encode("utf-8"))] )
             self.producer.flush()
             return True
         except Exception as e:
