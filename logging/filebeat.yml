@@ -58,7 +58,8 @@ output.elasticsearch:
   username: "filebeat_writer"
   password: "filebeat@2025"
   ssl:
-    certificate_authorities: ["/etc/ssl/certs/ca.crt"]
+    certificate_authorities:
+      ["/usr/local/share/ca-certificates/elasticsearch.crt"]
     verification_mode: certificate
   index: "%{[@metadata.index]}"
   document_id: "%{[@metadata][id]}"
