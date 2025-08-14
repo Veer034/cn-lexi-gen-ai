@@ -1,7 +1,12 @@
 filebeat.inputs:
   - type: log
     paths:
-      - /var/log/containers/cn-lexi-mail-ai*.log
+      - /var/log/cn-lexi-mail-ai/*.log
+      - /home/azureuser/cn-lexi-mail-ai/logs/*.log
+      - /var/log/cn-lexi-gen-ai/*.log
+      - /home/azureuser/cn-lexi-gen-ai/logs/*.log
+      - /var/log/cn-data-forge-ai/*.log
+      - /home/azureuser/cn-data-forge-ai/logs/*.log
     multiline.pattern: '^\d{4}-\d{2}-\d{2}'
     multiline.negate: true
     multiline.match: after
