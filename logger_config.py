@@ -8,11 +8,12 @@ import contextvars
 # Context variable to hold tracking_id per request
 tracking_id_var = contextvars.ContextVar("tracking_id", default="NA")
 
-class ContextFilter(logging.Filter):
-    def filter(self, record):
-        record.tracking_id = tracking_id_var.get()
-        record.threadName = threading.current_thread().name
-        return True
+class SafeFormatter(logging.Formatter):
+    def format(self, record):
+        if not hasattr(record, "tracking_id"):
+            record.tracking_id = "NA"
+        return super().format(record)
+
 
 def setup_logging():
     log_dir = Path("logs")
@@ -26,10 +27,11 @@ def setup_logging():
     )
     console_handler = logging.StreamHandler(sys.stdout)
 
-    formatter = logging.Formatter(
+    formatter = SafeFormatter(
         fmt="%(asctime)s [%(threadName)s] [%(tracking_id)s] %(levelname)s %(name)s - %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S"
     )
+
     file_handler.setFormatter(formatter)
     console_handler.setFormatter(formatter)
 
