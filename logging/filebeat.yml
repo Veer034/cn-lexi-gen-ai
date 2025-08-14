@@ -1,4 +1,11 @@
 filebeat.inputs:
+  - type: log
+    paths:
+      - /var/log/containers/cn-lexi-mail-ai*.log
+    multiline.pattern: '^\d{4}-\d{2}-\d{2}'
+    multiline.negate: true
+    multiline.match: after
+
   - type: journald
     id: journald-services
     include_matches:
@@ -7,7 +14,7 @@ filebeat.inputs:
       - "SYSTEMD_UNIT=cn-data-forge-ai.service"
       - "SYSTEMD_UNIT=cn-lexi-mail-ai.service"
 setup.template.name: "logs"
-setup.template.pattern: "service-logs-*,infra-logs-*"
+setup.template.pattern: "ai-service-logs-*"
 setup.template.settings:
   index.number_of_shards: 1
   index.number_of_replicas: 0
@@ -32,10 +39,10 @@ processors:
             var now = new Date();
             var year = now.getFullYear();
             var month = (now.getMonth() + 1) < 10 ? "0" + (now.getMonth() + 1) : "" + (now.getMonth() + 1);
-            var fallbackDate = year + "-" + month;
+            var date = year + "-" + month;
 
             if (!event.Get("@metadata.index")) {
-              event.Put("@metadata.index", "service-logs-" + fallbackDate);
+              event.Put("@metadata.index", "ai-service-logs-" + date);
             }
 
             // === 3. Create document ID ===
@@ -51,8 +58,13 @@ processors:
             }
 
           } catch (e) {
+              var now = new Date();
+            var year = now.getFullYear();
+            var month = (now.getMonth() + 1) < 10 ? "0" + (now.getMonth() + 1) : "" + (now.getMonth() + 1);
+            var date = year + "-" + month;
+
             // On error, default index and skip doc ID
-            event.Put("@metadata.index", "service-logs-fallback");
+            event.Put("@metadata.index", "ai-service-logs-" + date);
           }
         }
 
