@@ -66,33 +66,16 @@ processors:
           }
           
           var logLevel = "UNKNOWN";
-          var originalMessage = event.Get("message");
-          if (originalMessage) {
-            // Try common log level keywords anywhere in the string
-            var levelMatch = originalMessage.match(/(?:^|\s)(DEBUG|INFO|WARN|ERROR|TRACE|FATAL)(?:\s|:)/i);
-            if (levelMatch) {
-              logLevel = levelMatch[1];
-            }
+          var logLevelMatch = message.match(/\[(INFO|WARN|WARNING|ERROR|DEBUG|CRITICAL|FATAL)\]/);
+          if (logLevelMatch) {
+            logLevel = logLevelMatch[1];
           }
-
-          if (logLevel) {
-            var cleanLogLevel = logLevel.trim().toUpperCase();
-            // Extract valid log levels (INFO, DEBUG, WARN, ERROR, TRACE, FATAL)
-            var validLevels = ["INFO", "DEBUG", "WARN", "ERROR", "TRACE", "FATAL"];
-            for (var i = 0; i < validLevels.length; i++) {
-              if (cleanLogLevel.indexOf(validLevels[i]) !== -1) {
-                event.Put("log_level", validLevels[i]);
-                break;
-              }
-            }
-          }
-
-          var originalMsg = event.Get("message");
           
           event.Put("service_name", serviceName);
           event.Put("tracking_id", trackingId);
-          event.Put("log_message", originalMsg);
-          
+          event.Put("log_message", message);
+          event.Put("log_level", logLevel);
+
           event.Put("@metadata.index", indexName);
           event.Delete("@metadata._index");
           event.Delete("@metadata.beat");

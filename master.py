@@ -20,6 +20,8 @@ from response import ExtractionAnalyticsDto
 from manalLangaugeDetection import ManualLanguageDetector
 from libaryLanguage import LibraryLanguageDetector
 from logger_config import tracking_id_var, get_logger
+from azure_openai_client import AzureUniversalServiceClient
+
 
 from logger_config import get_logger
 logger = get_logger(__name__)
@@ -27,7 +29,7 @@ logger = get_logger(__name__)
 # Initialize app
 app = FastAPI(title="Vector Search Service")
 
-
+isMistralEnabledForFAQ = MISTRAL_CONFIG['enabledForFAQ'];
 # For Getting trackingId
 @app.middleware("http")
 async def add_tracking_id_middleware(request: Request, call_next):
@@ -246,7 +248,7 @@ class VectorSearchService:
             logger.error(f"Error searching Elasticsearch: {str(e)}", exc_info=True)
             raise
   
-    async def generate_answer_from_mistral(
+    async def generate_answer_from_mistral_or_azure(
         self,
         query: str,
         contents: List[str],
@@ -255,94 +257,87 @@ class VectorSearchService:
         max_length: int = 200,
     ) -> Dict[str, Any]:
         """
-        Generate an answer to the query using LLM based strictly on the provided context
-        
-        Args:
-            query (str): The specific question to be answered
-            contents (List[str]): List of context strings to base the answer on
-            language (str): Language of the response
-            tone (str): Tone of the response
-            max_length (int): Maximum length of the response
-        
-        Returns:
-            Dict[str, Any]: LLM response or error details
+        Generate an answer to the query using either Mistral (self-hosted) or Azure OpenAI Service.
         """
         try:
-            # Combine contents into context
-            context = "\n\n".join(contents)  # Direct join of string array
-            
-            # Calculate an approximate token count (assuming ~4 chars per token on average)
-            # For a 25-30 word limit (approximately 35-45 tokens)
-            token_limit = min(max_length // 4, 45)  # Set upper bound to 45 tokens
-       
+            # Combine context
+            context = "\n\n".join(contents)
+            token_limit = min(max_length // 4, 45)  # Approximate token limit
 
-            # Extract specific information if present
-            info_extraction_prompt = f"""
-            First, identify ALL specific facts, numbers, dates, limitations, and policy details in this context:
-            {context}
-            
-            List only the specific details found (timeframes, deadlines, rules, limits, etc.). Be concise.
-            """
-            
-            # Strict system prompt to force context-only responses
+            # System prompt
             system_prompt = f"""CRITICAL INSTRUCTIONS:
-            1. You MUST ONLY answer based on the EXACT provided context
-            2. You MUST provide a BRIEF response - no more than {token_limit} tokens
-            3. Use a {tone} tone and be extremely concise
-            4. Only include the most essential details that directly answer the query
-            5. If the answer CANNOT be found in the context, respond with "Not provided in the context"
-            6. Do NOT add any explanations or information not present in the context
-            7. Do NOT exceed {token_limit} tokens in your response
-            8. Format your answer as a single paragraph with no bullet points or lists"""
-            
-            # User prompt emphasizing context-only response
+    1. You MUST ONLY answer based on the EXACT provided context
+    2. You MUST provide a BRIEF response - no more than {token_limit} tokens
+    3. Use a {tone} tone and be extremely concise
+    4. Only include the most essential details that directly answer the query
+    5. If the answer CANNOT be found in the context, respond with "Not provided in the context"
+    6. Do NOT add any explanations or information not present in the context
+    7. Do NOT exceed {token_limit} tokens in your response
+    8. Format your answer as a single paragraph with no bullet points or lists"""
+
+            # User prompt
             user_prompt = f"""Reference content:
-            {context}
-            
-            Question: {query}
-            
-            IMPORTANT: Provide a comprehensive answer based ONLY on information in the given context in {language} language.
-            Include ALL relevant policy details, time limits, conditions, or restrictions that apply to this question.
-            """
-            
-            # Prepare the request payload - adjusting max_tokens
-            data = {
-                "model": MISTRAL_CONFIG['model'],
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                "stream": False,
-                "max_tokens": max_length,  # Allow more tokens for a complete answer
-                "temperature": 0.2  # Lower temperature for more precise factual responses
-            }
-            
-            # Log the request for debugging
-            logger.info("Sending context-constrained request to LLM: %s", json.dumps(data, indent=2))
-            
-            # Use httpx for async request
-            response = await self.http_client.post(
+    {context}
+
+    Question: {query}
+
+    IMPORTANT: Provide a comprehensive answer based ONLY on information in the given context in {language} language.
+    Include ALL relevant policy details, time limits, conditions, or restrictions that apply to this question."""
+
+            response_data = {}
+
+            if isMistralEnabledForFAQ:
+                # Prepare payload for Mistral
+                data = {
+                    "model": MISTRAL_CONFIG['model'],
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    "stream": False,
+                    "max_tokens": max_length,
+                    "temperature": 0.2
+                }
+
+                logger.info("Sending context-constrained request to Mistral: %s", json.dumps(data, indent=2))
+
+                response = await self.http_client.post(
                     MISTRAL_CONFIG['chat_url'],
                     headers={"Content-Type": "application/json"},
                     json=data,
                     timeout=MISTRAL_CONFIG['timeout']
-            )
-            
-            # Error handling for non-200 responses
-            if response.status_code != 200:
-                logger.error(f"LLM service error: {response.status_code} - {response.text}")
-                return {"error": f"Error generating answer: LLM service returned status {response.status_code}"}
-            
-            # Log and return the response
-            response_data = response.json()
-            logger.info(f"Context-constrained Response Status: {response_data}")
-            
+                )
+
+                if response.status_code != 200:
+                    logger.error(f"Mistral LLM error: {response.status_code} - {response.text}")
+                    return {"error": f"Mistral LLM returned status {response.status_code}"}
+
+                response_data = response.json()
+
+            else:
+                # Call Azure OpenAI Service (updated to use new cost-efficient client)
+                azure_client = AzureOpenAIServiceClient()  # Uses the updated cost-efficient client
+
+                logger.info("Sending context-constrained request to system_prompt: %s , user_prompt: %s", system_prompt,user_prompt)
+
+                response_data = await azure_client.generate_answer(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    max_tokens=max_length,
+                    temperature=0.2,
+                    include_usage=False  # Keep costs minimal - only get content
+                )
+                
+                # Clean up the client
+                await azure_client.close()
+
+            logger.info(f"LLM Response: {response_data}")
             return response_data
-            
+
         except Exception as e:
             logger.error(f"Error generating answer with LLM: {str(e)}", exc_info=True)
             return {"error": f"Error generating answer: {str(e)}"}
-
+        
     async def process_search_request(
         self, 
         query: str, 
@@ -376,7 +371,7 @@ class VectorSearchService:
     
         
         if search_result["contents"]:
-            mistral_response = await self.generate_answer_from_mistral(
+            response = await self.generate_answer_from_mistral_or_azure(
                 query,
                 search_result["contents"],
                 language=language,
@@ -385,15 +380,15 @@ class VectorSearchService:
             )
 
             # Add extracted details to search_result
-            message = mistral_response.get("message", {})
+            message = response.get("message", {})
             content = message.get("content", "")
 
             search_result["answer"] = content
             # Convert nanoseconds to milliseconds for better integer-based analytics
-            search_result["total_duration"] = int(mistral_response.get("total_duration", 0) / 1_000_000)  # nano to milli
-            search_result["load_duration"] = int(mistral_response.get("load_duration", 0) / 1_000_000)
-            search_result["prompt_eval_duration"] = int(mistral_response.get("prompt_eval_duration", 0) / 1_000_000)
-            search_result["eval_duration"] = int(mistral_response.get("eval_duration", 0) / 1_000_000)
+            search_result["total_duration"] = int(response.get("total_duration", 0) / 1_000_000)  # nano to milli
+            search_result["load_duration"] = int(response.get("load_duration", 0) / 1_000_000)
+            search_result["prompt_eval_duration"] = int(response.get("prompt_eval_duration", 0) / 1_000_000)
+            search_result["eval_duration"] = int(response.get("eval_duration", 0) / 1_000_000)
 
             logger.info(
                 f"Processed search request for query: {query}, "

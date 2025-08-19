@@ -92,23 +92,23 @@ Environment="OLLAMA_HOST=0.0.0.0:11434"
 Environment="OLLAMA_ORIGINS=*"
 
 # Concurrency + queue (start here; tune with load test)
-Environment="OLLAMA_NUM_PARALLEL=5"
-Environment="OLLAMA_MAX_QUEUE=40"
+Environment="OLLAMA_NUM_PARALLEL=3"
+Environment="OLLAMA_MAX_QUEUE=15"
 
 # Keep single model hot in RAM
 Environment="OLLAMA_MAX_LOADED_MODELS=1"
 Environment="OLLAMA_KEEP_ALIVE=1200"
 
 # CPU locality
-Environment="OLLAMA_NUMA_PINNING=1"
+Environment="OLLAMA_NUMA_PINNING=0"
 
 # CPU‑only note: FLASH_ATTENTION has no effect on CPU; omit it.
 
 # ==== Limits & Logs ====
 LimitNOFILE=65536
-LimitNPROC=8192
-LimitAS=infinity
-LimitMEMLOCK=infinity
+LimitNPROC=4096
+LimitAS=14G
+LimitMEMLOCK=14G
 StandardOutput=append:/var/log/ollama/service.log
 StandardError=append:/var/log/ollama/error.log
 

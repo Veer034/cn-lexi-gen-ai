@@ -23,8 +23,17 @@ KAFKA_CONFIG = {
 }
 
 MISTRAL_CONFIG = {
+    'enabledForFAQ' : os.getenv('MISTRAL_FAQ_ENABLED', False),
     'chat_url': os.getenv('MISTRAL_CHAT_URL', 'http://localhost:11434/api/chat'),
     'version_url': os.getenv('MISTRAL_VERSION_URL', 'http://localhost:11434/api/version'),
     'model': os.getenv('MISTRAL_MODEL', 'mistral'),
-    'timeout': 240,
+    'timeout': 120,
+}
+
+
+AZURE_CLIENT_CONFIG = {
+    'endpoint_url': os.getenv('AZURE_ENDPOINT_URL', 'https://external-ai-model-resource.cognitiveservices.azure.com/'),
+    'api_key': os.getenv('AZURE_API_KEY', ''),
+    'deployment_name': os.getenv('AZURE_DEPLOYMENT_ID', 'gpt-4o-mini'),
+    'api_version': os.getenv('API_VERSION', '2024-12-01-preview')
 }
