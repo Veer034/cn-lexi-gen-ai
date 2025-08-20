@@ -378,7 +378,7 @@ class VectorSearchService:
             
             # Execute search (same as original)
             response = await self.es_client.search(
-                index=self.es_config['tenant_document_index_name'],
+                index=ES_CONFIG['tenant_document_index_name'],
                 body=query,
                 size=top_k
             )
@@ -450,7 +450,7 @@ class VectorSearchService:
             }
             
             adjacent_response = await self.es_client.search(
-                index=self.es_config['tenant_document_index_name'],
+                index=ES_CONFIG['tenant_document_index_name'],
                 body=adjacent_query
             )
             
