@@ -33,14 +33,14 @@ isMistralEnabledForFAQ = MISTRAL_CONFIG['enabledForFAQ'];
 # For Getting trackingId
 @app.middleware("http")
 async def add_tracking_id_middleware(request: Request, call_next):
-    tracking_id = request.headers.get("trackingId", "NA")
+    tracking_id = request.headers.get("X-Tracking-ID", "NA")
     tracking_id_var.set(tracking_id)
     response = await call_next(request)
     return response
 
 
 # Define request and response models
-class SearchRequest(BaseModel):
+class AISearchRequest(BaseModel):
     query: str
     tenantId: str
     language:  str  
@@ -49,7 +49,6 @@ class SearchRequest(BaseModel):
     metadataFilters: Optional[Dict[str, Any]] = None
     answerTone: str = "polite"
     maxAnswerLength: int = 300
-
 
 class AISearchResultDto(BaseModel):
     isGreeting: bool
@@ -88,7 +87,7 @@ class AsyncKafkaProducer:
                 key = str(key).encode('utf-8')
             
             tracking_id = tracking_id_var.get() or "NA"
-            self.producer.produce(topic, key=key, value=value, callback=callback,  headers=[("trackingId", tracking_id.encode("utf-8"))] )
+            self.producer.produce(topic, key=key, value=value, callback=callback,  headers=[("X-Tracking-ID", tracking_id.encode("utf-8"))] )
             self.producer.flush()
             return True
         except Exception as e:
@@ -812,7 +811,7 @@ async def get_search_service():
 # API Endpoints
 @app.post("/lexi-gen-ai/search")
 async def search(
-    request: SearchRequest,
+    request: AISearchRequest,
     search_service: VectorSearchService = Depends(get_search_service)
 ):
     """Endpoint to search documents using vector similarity"""
