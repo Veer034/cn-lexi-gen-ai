@@ -3,7 +3,7 @@ import json
 import logging
 from typing import Dict, Any, List, Optional
 from openai import AsyncAzureOpenAI
-
+from config import AZURE_CLIENT_CONFIG
 logger = logging.getLogger(__name__)
 
 class AzureOpenAIServiceClient:

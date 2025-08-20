@@ -20,7 +20,7 @@ from response import ExtractionAnalyticsDto
 from manalLangaugeDetection import ManualLanguageDetector
 from libaryLanguage import LibraryLanguageDetector
 from logger_config import tracking_id_var, get_logger
-from azure_openai_client import AzureUniversalServiceClient
+from azure_openai_client import AzureOpenAIServiceClient
 
 
 from logger_config import get_logger
@@ -69,7 +69,8 @@ class AsyncKafkaProducer:
             'bootstrap.servers': bootstrap_servers
         })
         self.is_connected = True
-        
+
+
     async def send(self, topic, key=None, value=None):
         return await asyncio.to_thread(
             self._produce, topic, key, value
@@ -155,10 +156,80 @@ class VectorSearchService:
         
         # Create a pool of workers for CPU-bound tasks
         self.process_pool = None
-        
+        self.QUESTION_INDICATORS = self._initialize_question_indicators()
+       
         logger.info("🎯 VectorSearchService initialization completed!")
+            
+        
+        
+    def _initialize_question_indicators(self) -> Dict[str, List[str]]:
+        """Initialize question words for different languages"""
+        question_words = {
+            # Default/English
+            'en': ['what', 'how', 'when', 'where', 'why', 'who', 'which', 'can', 'is', 'are', 'do', 'does', 'will', 'would', 'could', 'should'],
+            
+            # Latin script European languages
+            'de': ['was', 'wie', 'wann', 'wo', 'warum', 'wer', 'welche', 'können', 'ist', 'sind', 'machen', 'wird', 'würde', 'könnte', 'sollte'],
+            'es': ['qué', 'cómo', 'cuándo', 'dónde', 'por qué', 'quién', 'cuál', 'puede', 'es', 'son', 'hacer', 'será', 'haría', 'podría', 'debería'],
+            'fr': ['quoi', 'comment', 'quand', 'où', 'pourquoi', 'qui', 'quel', 'peut', 'est', 'sont', 'faire', 'sera', 'ferait', 'pourrait', 'devrait'],
+            'it': ['cosa', 'come', 'quando', 'dove', 'perché', 'chi', 'quale', 'può', 'è', 'sono', 'fare', 'sarà', 'farebbe', 'potrebbe', 'dovrebbe'],
+            'pt': ['o que', 'como', 'quando', 'onde', 'por que', 'quem', 'qual', 'pode', 'é', 'são', 'fazer', 'será', 'faria', 'poderia', 'deveria'],
+            'nl': ['wat', 'hoe', 'wanneer', 'waar', 'waarom', 'wie', 'welke', 'kan', 'is', 'zijn', 'doen', 'zal', 'zou', 'kon', 'moest'],
+            'pl': ['co', 'jak', 'kiedy', 'gdzie', 'dlaczego', 'kto', 'który', 'może', 'jest', 'są', 'robić', 'będzie', 'by', 'mógł', 'powinien'],
+            'sv': ['vad', 'hur', 'när', 'var', 'varför', 'vem', 'vilken', 'kan', 'är', 'är', 'göra', 'kommer', 'skulle', 'kunde', 'borde'],
+            'no': ['hva', 'hvordan', 'når', 'hvor', 'hvorfor', 'hvem', 'hvilken', 'kan', 'er', 'er', 'gjøre', 'vil', 'ville', 'kunne', 'burde'],
+            'da': ['hvad', 'hvordan', 'hvornår', 'hvor', 'hvorfor', 'hvem', 'hvilken', 'kan', 'er', 'er', 'gøre', 'vil', 'ville', 'kunne', 'burde'],
+            'fi': ['mitä', 'miten', 'milloin', 'missä', 'miksi', 'kuka', 'mikä', 'voi', 'on', 'ovat', 'tehdä', 'tulee', 'tekisi', 'voisi', 'pitäisi'],
+            'hu': ['mi', 'hogyan', 'mikor', 'hol', 'miért', 'ki', 'melyik', 'tud', 'van', 'vannak', 'csinál', 'fog', 'tenné', 'tudna', 'kellene'],
+            'cs': ['co', 'jak', 'kdy', 'kde', 'proč', 'kdo', 'který', 'může', 'je', 'jsou', 'dělat', 'bude', 'by', 'mohl', 'měl'],
+            'tr': ['ne', 'nasıl', 'ne zaman', 'nerede', 'neden', 'kim', 'hangi', 'yapabilir', 'olan', 'olan', 'yapmak', 'olacak', 'yapardı', 'yapabilir', 'yapmalı'],
+            
+            # Cyrillic script languages
+            'ru': ['что', 'как', 'когда', 'где', 'почему', 'кто', 'который', 'может', 'есть', 'являются', 'делать', 'будет', 'бы', 'мог', 'должен'],
+            'uk': ['що', 'як', 'коли', 'де', 'чому', 'хто', 'який', 'може', 'є', 'є', 'робити', 'буде', 'б', 'міг', 'повинен'],
+            'bg': ['какво', 'как', 'кога', 'къде', 'защо', 'кой', 'който', 'може', 'е', 'са', 'правя', 'ще', 'би', 'можеше', 'трябва'],
+            
+            # Hindi and other Indic languages
+            'hi': ['क्या', 'कैसे', 'कब', 'कहाँ', 'क्यों', 'कौन', 'कौन सा', 'कर सकता', 'है', 'हैं', 'करना', 'होगा', 'करेगा', 'कर सकता', 'चाहिए'],
+            'mr': ['काय', 'कसे', 'केव्हा', 'कुठे', 'का', 'कोण', 'कोणते', 'करू शकतो', 'आहे', 'आहेत', 'करणे', 'होईल', 'करेल', 'करू शकतो', 'पाहिजे'],
+            'bn': ['কি', 'কিভাবে', 'কখন', 'কোথায়', 'কেন', 'কে', 'কোনটি', 'পারে', 'আছে', 'আছে', 'করা', 'হবে', 'করবে', 'পারে', 'উচিত'],
+            'pa': ['ਕੀ', 'ਕਿਵੇਂ', 'ਕਦੋਂ', 'ਕਿੱਥੇ', 'ਕਿਉਂ', 'ਕੌਣ', 'ਕਿਹੜਾ', 'ਕਰ ਸਕਦਾ', 'ਹੈ', 'ਹਨ', 'ਕਰਨਾ', 'ਹੋਵੇਗਾ', 'ਕਰੇਗਾ', 'ਕਰ ਸਕਦਾ', 'ਚਾਹੀਦਾ'],
+            'gu': ['શું', 'કેવી રીતે', 'ક્યારે', 'ક્યાં', 'શા માટે', 'કોણ', 'કયું', 'કરી શકે', 'છે', 'છે', 'કરવું', 'હશે', 'કરશે', 'કરી શકે', 'જોઈએ'],
+            'ta': ['என்ன', 'எப்படி', 'எப்போது', 'எங்கே', 'ஏன்', 'யார்', 'எது', 'முடியும்', 'இருக்கிறது', 'உள்ளன', 'செய்ய', 'இருக்கும்', 'செய்யும்', 'முடியும்', 'வேண்டும்'],
+            'te': ['ఏమిటి', 'ఎలా', 'ఎప్పుడు', 'ఎక్కడ', 'ఎందుకు', 'ఎవరు', 'ఏది', 'చేయగలరు', 'ఉంది', 'ఉన్నాయి', 'చేయడం', 'ఉంటుంది', 'చేస్తారు', 'చేయగలరు', 'చేయాలి'],
+            'kn': ['ಏನು', 'ಹೇಗೆ', 'ಯಾವಾಗ', 'ಎಲ್ಲಿ', 'ಏಕೆ', 'ಯಾರು', 'ಯಾವುದು', 'ಮಾಡಬಹುದು', 'ಇದೆ', 'ಇವೆ', 'ಮಾಡುವುದು', 'ಇರುತ್ತದೆ', 'ಮಾಡುತ್ತಾರೆ', 'ಮಾಡಬಹುದು', 'ಮಾಡಬೇಕು'],
+            'ml': ['എന്ത്', 'എങ്ങനെ', 'എപ്പോൾ', 'എവിടെ', 'എന്തുകൊണ്ട്', 'ആര്', 'ഏത്', 'കഴിയും', 'ഉണ്ട്', 'ഉണ്ട്', 'ചെയ്യുക', 'ഉണ്ടാകും', 'ചെയ്യും', 'കഴിയും', 'വേണം'],
+            
+            # Middle Eastern languages
+            'ar': ['ما', 'كيف', 'متى', 'أين', 'لماذا', 'من', 'أي', 'يمكن', 'هو', 'هم', 'يفعل', 'سوف', 'سيفعل', 'يمكن', 'يجب'],
+            'fa': ['چه', 'چگونه', 'کی', 'کجا', 'چرا', 'کی', 'کدام', 'می‌تواند', 'است', 'هستند', 'انجام دادن', 'خواهد', 'خواهد کرد', 'می‌تواند', 'باید'],
+            'ur': ['کیا', 'کیسے', 'کب', 'کہاں', 'کیوں', 'کون', 'کون سا', 'کر سکتا', 'ہے', 'ہیں', 'کرنا', 'ہوگا', 'کرے گا', 'کر سکتا', 'چاہیے'],
+            'he': ['מה', 'איך', 'מתי', 'איפה', 'למה', 'מי', 'איזה', 'יכול', 'הוא', 'הם', 'לעשות', 'יהיה', 'יעשה', 'יכול', 'צריך'],
+            
+            # East Asian languages
+            'zh': ['什么', '如何', '什么时候', '哪里', '为什么', '谁', '哪个', '可以', '是', '是', '做', '将', '会', '可以', '应该'],
+            'zh-tw': ['什麼', '如何', '什麼時候', '哪裡', '為什麼', '誰', '哪個', '可以', '是', '是', '做', '將', '會', '可以', '應該'],
+            'ja': ['何', 'どのように', 'いつ', 'どこ', 'なぜ', '誰', 'どの', 'できる', 'です', 'である', 'する', 'でしょう', 'します', 'できる', 'すべき'],
+            'ko': ['무엇', '어떻게', '언제', '어디', '왜', '누구', '어느', '할 수 있다', '이다', '이다', '하다', '것이다', '할 것이다', '할 수 있다', '해야 한다'],
+            
+            # Thai
+            'th': ['อะไร', 'อย่างไร', 'เมื่อไหร่', 'ที่ไหน', 'ทำไม', 'ใคร', 'ไหน', 'สามารถ', 'เป็น', 'เป็น', 'ทำ', 'จะ', 'จะทำ', 'สามารถ', 'ควร'],
+            
+            # Indonesian and Malay
+            'id': ['apa', 'bagaimana', 'kapan', 'dimana', 'mengapa', 'siapa', 'yang mana', 'bisa', 'adalah', 'adalah', 'melakukan', 'akan', 'akan melakukan', 'bisa', 'harus'],
+            'ms': ['apa', 'bagaimana', 'bila', 'dimana', 'mengapa', 'siapa', 'yang mana', 'boleh', 'adalah', 'adalah', 'melakukan', 'akan', 'akan melakukan', 'boleh', 'harus'],
+            
+            # Vietnamese
+            'vi': ['gì', 'làm thế nào', 'khi nào', 'ở đâu', 'tại sao', 'ai', 'cái nào', 'có thể', 'là', 'là', 'làm', 'sẽ', 'sẽ làm', 'có thể', 'nên'],
+            
+            # African languages
+            'sw': ['nini', 'jinsi', 'lini', 'wapi', 'kwa nini', 'nani', 'ipi', 'inaweza', 'ni', 'ni', 'kufanya', 'itakuwa', 'itafanya', 'inaweza', 'inapaswa'],
+            'ha': ['me', 'ta yaya', 'yaushe', 'ina', 'me yasa', 'wane', 'wanne', 'iya', 'shi ne', 'su ne', 'yi', 'zai', 'zai yi', 'iya', 'ya kamata'],
+            'ig': ['gịnị', 'otú', 'mgbe', 'ebe', 'gịnị kpatara', 'onye', 'nke', 'nwere ike', 'bụ', 'bụ', 'ime', 'ga', 'ga ime', 'nwere ike', 'kwesịrị']
+        }
+        return question_words
 
-
+  
     
     async def generate_embeddings(self, query: str) -> List[float]:
         """Generate embeddings for a list of queries using a thread pool"""
@@ -181,22 +252,71 @@ class VectorSearchService:
         embeddings = self.st_model.encode(query)
         return embeddings.tolist()
     
-
-    async def search_elasticsearch(
-        self, 
-        embedding: List[float], 
-        tenant_id: str, 
-        top_k: int = 5, 
-        threshold: float = 0.55,
-        metadata_filters: Optional[Dict[str, Any]] = None
-    ) -> List[Dict[str, Any]]:
-        """Search Elasticsearch using dot product with normalized vectors for ES 7.17"""
-        try:
+    def _is_question(self, query: str, language: str = None) -> bool:
+        """Check if query is a question in multiple languages"""
+        if not query:
+            return False
+        
+        query_lower = query.lower().strip()
+        
+        # Universal question mark check
+        if query_lower.endswith('?') or '?' in query_lower:
+            return True
+        
+        # Language-specific question marks
+        if query_lower.endswith('؟'):  # Arabic question mark
+            return True
+        if query_lower.endswith('？'):  # CJK question mark
+            return True
+        
+        # If no language specified, try to detect it
+        if not language:
+            language = self.detect_best_language(query)
+        
+        # Get question indicators for the language
+        question_indicators = self.QUESTION_INDICATORS.get(language, self.QUESTION_INDICATORS.get('en', []))
+        
+        if not question_indicators:
+            # Fallback: if language not supported, use English indicators
+            question_indicators = self.QUESTION_INDICATORS['en']
+        
+        # Check for question words at the beginning (most common pattern)
+        words = query_lower.split()
+        if words:
+            first_word = words[0]
+            # Direct match
+            if first_word in question_indicators:
+                return True
             
-            # Build the filter conditions
+            # Check if first word starts with a question word (for compound words)
+            for indicator in question_indicators:
+                if first_word.startswith(indicator) and len(indicator) > 2:
+                    return True
+        
+        # Check for question words anywhere in short queries (< 6 words)
+        if len(words) <= 5:
+            for word in words:
+                if word in question_indicators:
+                    return True
+        
+        return False
+
+    # Updated search function without the problematic _is_question call
+    async def search_elasticsearch(
+            self, 
+            embedding: List[float], 
+            tenant_id: str, 
+            top_k: int = 5, 
+            threshold: float = 0.55,
+            metadata_filters: Optional[Dict[str, Any]] = None,
+            include_context: bool = True,
+            original_query: Optional[str] = None  # Add this to detect questions
+        ) -> List[Dict[str, Any]]:
+        """Enhanced search keeping your exact original logic but adding context"""
+        try:
+            # Build the filter conditions (exactly like your original)
             filter_conditions = [{"term": {"tenantId": tenant_id}}]
             
-            # Add metadata filters if provided
             if metadata_filters:
                 for key, value in metadata_filters.items():
                     if isinstance(value, list):
@@ -204,50 +324,178 @@ class VectorSearchService:
                     else:
                         filter_conditions.append({"term": {f"metadata.{key}": value}})
             
-            # Build the query
-            query = {
-                
-                "query": {
-                    "script_score": {
-                        "query": {
-                            "bool": {
-                                "filter": filter_conditions
-                            }
-                        },
-                        "script": {
-                            "source": "cosineSimilarity(params.query_vector, 'contentVector')",
-                            "params": {"query_vector": embedding}
-                        }
-                    }
-                }
-            }
-
-            logger.info(f" query {query}")
+            # Detect if query is a question (if original_query provided)
+            is_question_query = False
+            if original_query:
+                # Get language from metadata or detect it
+                query_language = None
+                if metadata_filters and 'language' in metadata_filters:
+                    query_language = metadata_filters['language']
+                is_question_query = self._is_question(original_query, query_language)
             
-            # Execute search
+            # Enhanced query with conditional FAQ boosting
+            if is_question_query:
+                # Boost FAQ content for questions
+                query = {
+                    "query": {
+                        "script_score": {
+                            "query": {
+                                "bool": {
+                                    "filter": filter_conditions
+                                }
+                            },
+                            "script": {
+                                "source": """
+                                    double base_score = cosineSimilarity(params.query_vector, 'contentVector');
+                                    double faq_boost = doc.containsKey('chunkType') && doc['chunkType'].size() > 0 && doc['chunkType'].value == 'faq' ? 1.15 : 1.0;
+                                    return base_score * faq_boost;
+                                """,
+                                "params": {"query_vector": embedding}
+                            }
+                        }
+                    },
+                    "_source": ["content", "documentId", "chunkPosition", "totalChunks", "chunkType", "metadata"]
+                }
+            else:
+                # Your exact original query
+                query = {
+                    "query": {
+                        "script_score": {
+                            "query": {
+                                "bool": {
+                                    "filter": filter_conditions
+                                }
+                            },
+                            "script": {
+                                "source": "cosineSimilarity(params.query_vector, 'contentVector')",
+                                "params": {"query_vector": embedding}
+                            }
+                        }
+                    },
+                    "_source": ["content", "documentId", "chunkPosition", "totalChunks", "chunkType", "metadata"]
+                }
+
+            logger.info(f"Enhanced query with question detection: {is_question_query}")
+            
+            # Execute search (same as original)
             response = await self.es_client.search(
-                index=ES_CONFIG['tenant_document_index_name'],
+                index=self.es_config['tenant_document_index_name'],
                 body=query,
                 size=top_k
             )
             
-
-            # Process results
+            # Process results with optional context enhancement
             results = {
                 "esTime": response['took'],
                 "contents": []
             }
+            
             for hit in response['hits']['hits']:
                 score = hit['_score']
                 if score >= threshold:
-                    results["contents"].append(hit['_source']['content'])
+                    if include_context:
+                        # Get enhanced content with context
+                        enhanced_content = await self._get_chunk_with_adjacent_context(
+                            hit['_source'], 
+                            tenant_id
+                        )
+                        results["contents"].append(enhanced_content)
+                    else:
+                        # Original behavior
+                        results["contents"].append(hit['_source']['content'])
             
-
             return results
+            
         except Exception as e:
             logger.error(f"Error searching Elasticsearch: {str(e)}", exc_info=True)
             raise
+
   
+    async def _get_chunk_with_adjacent_context(self, chunk_data: Dict, tenant_id: str) -> str:
+        """Get chunk content enhanced with adjacent context"""
+        try:
+            document_id = chunk_data.get('documentId')
+            chunk_position = chunk_data.get('chunkPosition')
+            total_chunks = chunk_data.get('totalChunks')
+            main_content = chunk_data.get('content', '')
+            
+            # If no position info, return original content
+            if chunk_position is None or total_chunks is None:
+                return main_content
+            
+            # Determine adjacent positions to fetch
+            adjacent_positions = []
+            if chunk_position > 0:
+                adjacent_positions.append(chunk_position - 1)  # Previous chunk
+            if chunk_position < total_chunks - 1:
+                adjacent_positions.append(chunk_position + 1)  # Next chunk
+            
+            # If no adjacent chunks, return main content
+            if not adjacent_positions:
+                return main_content
+            
+            # Query for adjacent chunks
+            adjacent_query = {
+                "query": {
+                    "bool": {
+                        "must": [
+                            {"term": {"tenantId": tenant_id}},
+                            {"term": {"documentId": document_id}},
+                            {"terms": {"chunkPosition": adjacent_positions}}
+                        ]
+                    }
+                },
+                "sort": [{"chunkPosition": "asc"}],
+                "size": len(adjacent_positions),
+                "_source": ["content", "chunkPosition"]
+            }
+            
+            adjacent_response = await self.es_client.search(
+                index=self.es_config['tenant_document_index_name'],
+                body=adjacent_query
+            )
+            
+            # Build enhanced content with context
+            context_parts = []
+            
+            # Add previous context if available
+            prev_content = ""
+            next_content = ""
+            
+            for adj_hit in adjacent_response['hits']['hits']:
+                adj_data = adj_hit['_source']
+                adj_position = adj_data['chunkPosition']
+                
+                if adj_position == chunk_position - 1:  # Previous chunk
+                    prev_content = adj_data['content']
+                elif adj_position == chunk_position + 1:  # Next chunk
+                    next_content = adj_data['content']
+            
+            # Construct enhanced content
+            enhanced_content = ""
+            
+            if prev_content:
+                # Add last portion of previous chunk for context
+                prev_words = prev_content.split()
+                prev_context = " ".join(prev_words[-50:]) if len(prev_words) > 50 else prev_content
+                enhanced_content += f"[Previous context: ...{prev_context}]\n\n"
+            
+            # Add main content
+            enhanced_content += main_content
+            
+            if next_content:
+                # Add first portion of next chunk for context
+                next_words = next_content.split()
+                next_context = " ".join(next_words[:50]) if len(next_words) > 50 else next_content
+                enhanced_content += f"\n\n[Following context: {next_context}...]"
+            
+            return enhanced_content
+            
+        except Exception as e:
+            logger.error(f"Error getting adjacent context: {str(e)}")
+            # Return original content if context retrieval fails
+            return chunk_data.get('content', '')
+
     async def generate_answer_from_mistral_or_azure(
         self,
         query: str,
