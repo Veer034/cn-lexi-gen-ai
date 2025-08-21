@@ -7,7 +7,7 @@ import uvicorn
 from typing import List, Dict, Any, Optional
 import asyncio
 import numpy as np
-
+import torch
 from fastapi import FastAPI, HTTPException, Depends, Request
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
@@ -34,6 +34,7 @@ isMistralEnabledForFAQ = MISTRAL_CONFIG['enabledForFAQ'];
 @app.middleware("http")
 async def add_tracking_id_middleware(request: Request, call_next):
     tracking_id = request.headers.get("X-Tracking-ID", "NA")
+    logger.info(f"Passed trackingId {tracking_id}")
     tracking_id_var.set(tracking_id)
     response = await call_next(request)
     return response
@@ -87,7 +88,11 @@ class AsyncKafkaProducer:
                 key = str(key).encode('utf-8')
             
             tracking_id = tracking_id_var.get() or "NA"
-            self.producer.produce(topic, key=key, value=value, callback=callback,  headers=[("X-Tracking-ID", tracking_id.encode("utf-8"))] )
+            if isinstance(tracking_id, bytes):
+                tracking_id_str = tracking_id.decode("utf-8")
+            else:
+                tracking_id_str = str(tracking_id)
+            self.producer.produce(topic, key=key, value=value, callback=callback,  headers=[("X-Tracking-ID", tracking_id_str)] )
             self.producer.flush()
             return True
         except Exception as e:
@@ -103,6 +108,9 @@ class AsyncKafkaProducer:
 class VectorSearchService:
     def __init__(self, model_path=None):
         logger.info("🔧 Initializing VectorSearchService components...")
+
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        logger.info(f"🖥️ Using device: {self.device}")
         # Initialize SentenceTransformer
         model_name = 'paraphrase-multilingual-mpnet-base-v2'
         # model_path = models_path or os.path.join(os.getcwd(), 'models', 'sentence_transformer')
@@ -110,12 +118,21 @@ class VectorSearchService:
         try:
             if model_path:
                 logger.info(f"📂 Loading model from local path: {model_path}")
-                self.st_model = SentenceTransformer(model_path)
+                self.st_model = SentenceTransformer(model_path, device=self.device)
                 logger.info("✅ Local model loaded successfully")
             else:
                 logger.info(f"🌐 Loading model {model_name} from Hugging Face...")
                 self.st_model = SentenceTransformer(model_name)
                 logger.info("✅ Hugging Face model loaded successfully")
+
+              # CRITICAL: Set model to evaluation mode and optimize
+            self.st_model.eval()
+            
+            # Enable optimizations for inference
+            if hasattr(torch, 'set_grad_enabled'):
+                torch.set_grad_enabled(False)  # Disable gradients for inference
+          
+            
         except Exception as e:
             logger.error(f"❌ Error loading sentence transformer model: {e}")
             raise
@@ -237,7 +254,7 @@ class VectorSearchService:
             
             # Move the embedding generation to a separate thread 
             # since SentenceTransformer is not async-compatible
-            embeddings = await asyncio.to_thread(self._generate_embeddings_sync, query)
+            embeddings = await asyncio.to_thread(self._generate_embeddings_sync_optimized, query)
             
             end_time = datetime.datetime.now()
             logger.info(f"Generated {len(query)} embeddings in {(end_time - start_time).total_seconds()} seconds")
@@ -245,77 +262,50 @@ class VectorSearchService:
         except Exception as e:
             logger.error(f"Error generating embeddings: {str(e)}", exc_info=True)
             raise
-    
-    def _generate_embeddings_sync(self, query: str) -> List[float]:
-        """Synchronous method to generate embeddings (runs in a thread)"""
-        embeddings = self.st_model.encode(query)
-        return embeddings.tolist()
-    
-    def _is_question(self, query: str, language: str = None) -> bool:
-        """Check if query is a question in multiple languages"""
-        if not query:
-            return False
-        
-        query_lower = query.lower().strip()
-        
-        # Universal question mark check
-        if query_lower.endswith('?') or '?' in query_lower:
-            return True
-        
-        # Language-specific question marks
-        if query_lower.endswith('؟'):  # Arabic question mark
-            return True
-        if query_lower.endswith('？'):  # CJK question mark
-            return True
-        
-        # If no language specified, try to detect it
-        if not language:
-            language = self.detect_best_language(query)
-        
-        # Get question indicators for the language
-        question_indicators = self.QUESTION_INDICATORS.get(language, self.QUESTION_INDICATORS.get('en', []))
-        
-        if not question_indicators:
-            # Fallback: if language not supported, use English indicators
-            question_indicators = self.QUESTION_INDICATORS['en']
-        
-        # Check for question words at the beginning (most common pattern)
-        words = query_lower.split()
-        if words:
-            first_word = words[0]
-            # Direct match
-            if first_word in question_indicators:
-                return True
-            
-            # Check if first word starts with a question word (for compound words)
-            for indicator in question_indicators:
-                if first_word.startswith(indicator) and len(indicator) > 2:
-                    return True
-        
-        # Check for question words anywhere in short queries (< 6 words)
-        if len(words) <= 5:
-            for word in words:
-                if word in question_indicators:
-                    return True
-        
-        return False
 
-    # Updated search function without the problematic _is_question call
-    async def search_elasticsearch(
-            self, 
-            embedding: List[float], 
-            tenant_id: str, 
-            top_k: int = 5, 
-            threshold: float = 0.55,
-            metadata_filters: Optional[Dict[str, Any]] = None,
-            include_context: bool = True,
-            original_query: Optional[str] = None  # Add this to detect questions
-        ) -> List[Dict[str, Any]]:
-        """Enhanced search keeping your exact original logic but adding context"""
+    def _generate_embeddings_sync_optimized(self, query: str) -> List[float]:
+        """Optimized synchronous embedding generation"""
         try:
-            # Build the filter conditions (exactly like your original)
+            # Performance optimizations
+            with torch.no_grad():  # Disable gradient computation
+                embeddings = self.st_model.encode(
+                    query,
+                    show_progress_bar=False,  # Disable progress bar for single queries
+                    convert_to_numpy=True,    # Direct numpy conversion
+                    normalize_embeddings=True,  # Normalize for cosine similarity
+                    batch_size=1,            # Single query batch
+                    device=self.device       # Explicit device specification
+                )
+            
+            # Convert to list efficiently
+            if isinstance(embeddings, np.ndarray):
+                return embeddings.tolist()
+            else:
+                return embeddings
+                
+        except Exception as e:
+            logger.error(f"❌ Error in sync embedding generation: {str(e)}")
+            raise
+
+
+
+
+    async def search_elasticsearch_with_dynamic_keywords(
+        self, 
+        embedding: List[float], 
+        tenant_id: str, 
+        top_k: int = 5, 
+        threshold: float = 0.55,
+        metadata_filters: Optional[Dict[str, Any]] = None,
+        include_context: bool = True,
+        original_query: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Enhanced search with context preservation and hybrid matching"""
+        try:
+            # Build the filter conditions
             filter_conditions = [{"term": {"tenantId": tenant_id}}]
             
+            # Add metadata filters if provided
             if metadata_filters:
                 for key, value in metadata_filters.items():
                     if isinstance(value, list):
@@ -323,40 +313,52 @@ class VectorSearchService:
                     else:
                         filter_conditions.append({"term": {f"metadata.{key}": value}})
             
-            # Detect if query is a question (if original_query provided)
-            is_question_query = False
+            # Build query based on whether we have original text
             if original_query:
-                # Get language from metadata or detect it
-                query_language = None
-                if metadata_filters and 'language' in metadata_filters:
-                    query_language = metadata_filters['language']
-                is_question_query = self._is_question(original_query, query_language)
-            
-            # Enhanced query with conditional FAQ boosting
-            if is_question_query:
-                # Boost FAQ content for questions
+                # Hybrid search: semantic + keyword
                 query = {
                     "query": {
-                        "script_score": {
-                            "query": {
-                                "bool": {
-                                    "filter": filter_conditions
+                        "bool": {
+                            "filter": filter_conditions,
+                            "should": [
+                                # Semantic search with normalized scoring (FIX HERE)
+                                {
+                                    "script_score": {
+                                        "query": {"match_all": {}},
+                                        "script": {
+                                            "source": "Math.max(0, (cosineSimilarity(params.query_vector, 'contentVector') + 1.0) / 2.0)",
+                                            "params": {"query_vector": embedding}
+                                        },
+                                        "boost": 2.0
+                                    }
+                                },
+                                # Keyword search for exact matches
+                                {
+                                    "multi_match": {
+                                        "query": original_query,
+                                        "fields": ["content^2", "keywords^1.5", "contextSummary"],
+                                        "type": "best_fields",
+                                        "boost": 1.0
+                                    }
+                                },
+                                # Boost FAQ content for question-like queries
+                                {
+                                    "bool": {
+                                        "must": [
+                                            {"term": {"chunkType": "faq"}},
+                                            {"match": {"content": original_query}}
+                                        ],
+                                        "boost": 1.5 if self._is_question(original_query) else 1.0
+                                    }
                                 }
-                            },
-                            "script": {
-                                "source": """
-                                    double base_score = cosineSimilarity(params.query_vector, 'contentVector');
-                                    double faq_boost = doc.containsKey('chunkType') && doc['chunkType'].size() > 0 && doc['chunkType'].value == 'faq' ? 1.15 : 1.0;
-                                    return base_score * faq_boost;
-                                """,
-                                "params": {"query_vector": embedding}
-                            }
+                            ],
+                            "minimum_should_match": 1
                         }
                     },
-                    "_source": ["content", "documentId", "chunkPosition", "totalChunks", "chunkType", "metadata"]
+                    "_source": ["content", "documentId", "chunkPosition", "totalChunks", "sectionTitle", "keywords", "metadata", "chunkType"]
                 }
             else:
-                # Your exact original query
+                # Fallback to semantic-only search with normalized scoring (FIX HERE)
                 query = {
                     "query": {
                         "script_score": {
@@ -366,41 +368,45 @@ class VectorSearchService:
                                 }
                             },
                             "script": {
-                                "source": "cosineSimilarity(params.query_vector, 'contentVector')",
+                                "source": "Math.max(0, (cosineSimilarity(params.query_vector, 'contentVector') + 1.0) / 2.0)",
                                 "params": {"query_vector": embedding}
                             }
                         }
                     },
-                    "_source": ["content", "documentId", "chunkPosition", "totalChunks", "chunkType", "metadata"]
+                    "_source": ["content", "documentId", "chunkPosition", "totalChunks", "sectionTitle", "keywords", "metadata", "chunkType"]
                 }
 
-            logger.info(f"Enhanced query with question detection: {is_question_query}")
+            logger.info(f"Enhanced query with original_query: {bool(original_query)}")
+            logger.info(f"ES query: {query}")
             
-            # Execute search (same as original)
+            # Execute search
             response = await self.es_client.search(
                 index=ES_CONFIG['tenant_document_index_name'],
                 body=query,
                 size=top_k
             )
             
-            # Process results with optional context enhancement
+            # Process results
             results = {
                 "esTime": response['took'],
                 "contents": []
             }
             
-            for hit in response['hits']['hits']:
-                score = hit['_score']
-                if score >= threshold:
-                    if include_context:
-                        # Get enhanced content with context
+            if include_context:
+                # Enhanced processing with adjacent context
+                for hit in response['hits']['hits']:
+                    score = hit['_score']
+                    if score >= threshold:
                         enhanced_content = await self._get_chunk_with_adjacent_context(
                             hit['_source'], 
                             tenant_id
                         )
                         results["contents"].append(enhanced_content)
-                    else:
-                        # Original behavior
+            else:
+                # Original processing (backward compatibility)
+                for hit in response['hits']['hits']:
+                    score = hit['_score']
+                    if score >= threshold:
                         results["contents"].append(hit['_source']['content'])
             
             return results
@@ -408,8 +414,22 @@ class VectorSearchService:
         except Exception as e:
             logger.error(f"Error searching Elasticsearch: {str(e)}", exc_info=True)
             raise
+        
 
-  
+    def _is_question(self, query: str) -> bool:
+        """Check if query is a question"""
+        question_indicators = ['what', 'how', 'when', 'where', 'why', 'who', 'which', 'can', 'is', 'are', 'do', 'does', 'will', 'would', 'could', 'should']
+        query_lower = query.lower().strip()
+        
+        # Check for question mark
+        if query_lower.endswith('?'):
+            return True
+        
+        # Check for question words at the beginning
+        first_word = query_lower.split()[0] if query_lower.split() else ""
+        return first_word in question_indicators
+
+ 
     async def _get_chunk_with_adjacent_context(self, chunk_data: Dict, tenant_id: str) -> str:
         """Get chunk content enhanced with adjacent context"""
         try:
@@ -419,7 +439,7 @@ class VectorSearchService:
             main_content = chunk_data.get('content', '')
             
             # If no position info, return original content
-            if chunk_position is None or total_chunks is None:
+            if chunk_position is None or total_chunks is None or document_id is None:
                 return main_content
             
             # Determine adjacent positions to fetch
@@ -455,9 +475,6 @@ class VectorSearchService:
             )
             
             # Build enhanced content with context
-            context_parts = []
-            
-            # Add previous context if available
             prev_content = ""
             next_content = ""
             
@@ -474,19 +491,25 @@ class VectorSearchService:
             enhanced_content = ""
             
             if prev_content:
-                # Add last portion of previous chunk for context
+                # Add relevant portion of previous chunk
                 prev_words = prev_content.split()
-                prev_context = " ".join(prev_words[-50:]) if len(prev_words) > 50 else prev_content
-                enhanced_content += f"[Previous context: ...{prev_context}]\n\n"
+                # Take last 30-50 words for context
+                context_size = min(50, len(prev_words) // 2)
+                if context_size > 0:
+                    prev_context = " ".join(prev_words[-context_size:])
+                    enhanced_content += f"[...{prev_context}] "
             
             # Add main content
             enhanced_content += main_content
             
             if next_content:
-                # Add first portion of next chunk for context
+                # Add relevant portion of next chunk
                 next_words = next_content.split()
-                next_context = " ".join(next_words[:50]) if len(next_words) > 50 else next_content
-                enhanced_content += f"\n\n[Following context: {next_context}...]"
+                # Take first 30-50 words for context
+                context_size = min(50, len(next_words) // 2)
+                if context_size > 0:
+                    next_context = " ".join(next_words[:context_size])
+                    enhanced_content += f" [{next_context}...]"
             
             return enhanced_content
             
@@ -494,6 +517,7 @@ class VectorSearchService:
             logger.error(f"Error getting adjacent context: {str(e)}")
             # Return original content if context retrieval fails
             return chunk_data.get('content', '')
+
 
     async def generate_answer_from_mistral_or_azure(
         self,
@@ -531,8 +555,6 @@ class VectorSearchService:
     IMPORTANT: Provide a comprehensive answer based ONLY on information in the given context in {language} language.
     Include ALL relevant policy details, time limits, conditions, or restrictions that apply to this question."""
 
-            response_data = {}
-
             if isMistralEnabledForFAQ:
                 # Prepare payload for Mistral
                 data = {
@@ -559,15 +581,27 @@ class VectorSearchService:
                     logger.error(f"Mistral LLM error: {response.status_code} - {response.text}")
                     return {"error": f"Mistral LLM returned status {response.status_code}"}
 
-                response_data = response.json()
+                mistral_response = response.json()
+                
+                # Extract content from Mistral's response format
+                try:
+                    content = mistral_response["choices"][0]["message"]["content"]
+                    return {
+                        "message": {
+                            "content": content
+                        }
+                    }
+                except (KeyError, IndexError) as e:
+                    logger.error(f"Unexpected Mistral response format: {mistral_response}")
+                    return {"error": f"Unexpected Mistral response format: {str(e)}"}
 
             else:
-                # Call Azure OpenAI Service (updated to use new cost-efficient client)
-                azure_client = AzureOpenAIServiceClient()  # Uses the updated cost-efficient client
+                # Call Azure OpenAI Service
+                azure_client = AzureOpenAIServiceClient()
 
-                logger.info("Sending context-constrained request to system_prompt: %s , user_prompt: %s", system_prompt,user_prompt)
+                logger.info("Sending context-constrained request to system_prompt: %s , user_prompt: %s", system_prompt, user_prompt)
 
-                response_data = await azure_client.generate_answer(
+                azure_response = await azure_client.generate_answer(
                     system_prompt=system_prompt,
                     user_prompt=user_prompt,
                     max_tokens=max_length,
@@ -578,13 +612,26 @@ class VectorSearchService:
                 # Clean up the client
                 await azure_client.close()
 
-            logger.info(f"LLM Response: {response_data}")
-            return response_data
+                # Azure response is already in the format we need: {"content": "..."}
+                # Convert to match expected format
+                if "content" in azure_response:
+                    return {
+                        "message": {
+                            "content": azure_response["content"]
+                        }
+                    }
+                elif "error" in azure_response:
+                    return azure_response
+                else:
+                    logger.error(f"Unexpected Azure response format: {azure_response}")
+                    return {"error": f"Unexpected Azure response format"}
 
         except Exception as e:
             logger.error(f"Error generating answer with LLM: {str(e)}", exc_info=True)
             return {"error": f"Error generating answer: {str(e)}"}
-        
+
+
+
     async def process_search_request(
         self, 
         query: str, 
@@ -607,7 +654,7 @@ class VectorSearchService:
             metadata_filters["language"] = language
                 
         # Create tasks for concurrent Elasticsearch searches
-        search_result = await self.search_elasticsearch(
+        search_result = await self.search_elasticsearch_with_dynamic_keywords(
                 embedding, 
                 tenant_id,
                 top_k, 
@@ -615,7 +662,8 @@ class VectorSearchService:
                 metadata_filters
             ) 
         
-    
+        
+        logger.info(f"contents: {search_result['contents']}, ");
         
         if search_result["contents"]:
             response = await self.generate_answer_from_mistral_or_azure(
@@ -817,8 +865,8 @@ async def search(
     """Endpoint to search documents using vector similarity"""
     try:
         # Generate a request ID for this specific request
-        request_id = str(uuid.uuid4())
-        logger.info(f"[{request_id}] Processing search request with query: {request}")
+        tracking_id = tracking_id_var.get() or "NA"
+        logger.info(f"[{tracking_id}] Processing search request with query: {request}")
 
         if not request.language:
             # Use your language detection logic here
@@ -831,8 +879,8 @@ async def search(
 
           # If greeting is detected, return the greeting response directly
         if greeting:
-            logger.info(f"[{request_id}] Greeting detected, responding with appropriate greeting")
-            return AISearchResultDto(isGreeting = True,result=greeting, requestId=request_id, contentSize=0)
+            logger.info(f"[{tracking_id}] Greeting detected, responding with appropriate greeting")
+            return AISearchResultDto(isGreeting = True,result=greeting, requestId=tracking_id, contentSize=0)
 
 
 
@@ -881,18 +929,18 @@ async def search(
         content_size = len(responseData.get("contents", []))
         print(content_size)
 
-        logger.info(f"[{request_id}] Search completed successfully")
-        return AISearchResultDto(isGreeting =False, result=answer, requestId=request_id, contentSize =content_size)
+        logger.info(f"[{tracking_id}] Search completed successfully")
+        return AISearchResultDto(isGreeting =False, result=answer, requestId=tracking_id, contentSize =content_size)
 
        
     except Exception as e:
         error_msg = f"Search request failed: {str(e)}"
-        logger.error(f"[{request_id}] {error_msg}", exc_info=True)
+        logger.error(f"[{tracking_id}] {error_msg}", exc_info=True)
         
-        # Return a custom error response that includes the request_id
+        # Return a custom error response that includes the X-Tracking-ID
         raise HTTPException(
             status_code=500, 
-            detail={"error": 'Something went wrong', "request_id": request_id}
+            detail={"error": 'Something went wrong', "X-Tracking-ID": tracking_id}
         )
 
 @app.get("/health")

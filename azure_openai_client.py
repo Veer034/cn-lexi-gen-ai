@@ -91,55 +91,6 @@ class AzureOpenAIServiceClient:
             logger.error(f"Exception calling Azure OpenAI: {str(e)}", exc_info=True)
             return {"error": f"Exception calling Azure OpenAI: {str(e)}"}
 
-    async def generate_answer_with_history(
-        self,
-        messages: List[Dict[str, str]],
-        max_tokens: int = 4096,
-        temperature: float = 0.2,
-        top_p: float = 1.0,
-        include_usage: bool = False,
-        **kwargs
-    ) -> Dict[str, Any]:
-        """
-        Generate answer with full conversation history.
-
-        Args:
-            messages (List[Dict[str, str]]): List of message objects with 'role' and 'content'
-            max_tokens (int): Maximum response tokens
-            temperature (float): Sampling temperature
-            top_p (float): Top-p sampling parameter
-            include_usage (bool): Whether to include token usage info
-            **kwargs: Additional parameters for the API call
-
-        Returns:
-            Dict[str, Any]: Minimal response with just content or error
-        """
-        try:
-            response = await self.client.chat.completions.create(
-                messages=messages,
-                model=self.deployment_name,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                **kwargs
-            )
-            
-            # Return minimal response to save on token costs
-            if include_usage:
-                return {
-                    "content": response.choices[0].message.content,
-                    "usage": {
-                        "completion_tokens": response.usage.completion_tokens,
-                        "prompt_tokens": response.usage.prompt_tokens,
-                        "total_tokens": response.usage.total_tokens
-                    }
-                }
-            else:
-                return {"content": response.choices[0].message.content}
-
-        except Exception as e:
-            logger.error(f"Exception calling Azure OpenAI: {str(e)}", exc_info=True)
-            return {"error": f"Exception calling Azure OpenAI: {str(e)}"}
 
     async def close(self):
         """Close the HTTP client."""

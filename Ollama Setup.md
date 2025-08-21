@@ -11,6 +11,22 @@ This guide configures a **Standard D8as v4** VM (8 vCPUs, 32 GiB RAM, no GPU) 
 - **Disk:** Premium SSD recommended, **/var/lib/ollama** on the fastest disk.
 - **Network:** Restrict access with NSG / firewall; avoid exposing the API to the public internet directly.
 
+```
+az vm create \
+  --resource-group convonest-prod \
+  --name ai-model \
+  --image Canonical:0001-com-ubuntu-server-jammy:22_04-lts-gen2:latest \
+  --size Standard_B2ms \
+  --admin-username azureuser \
+  --generate-ssh-keys \
+  --vnet-name data-services-vnet \
+  --subnet default \
+  --private-ip-address 10.0.0.8 \
+  --public-ip-sku Standard \
+  --storage-sku StandardSSD_LRS \
+  --os-disk-size-gb 64
+```
+
 ---
 
 ## 2) Install Ollama
@@ -89,10 +105,10 @@ StartLimitIntervalSec=0
 # ==== Ollama Tuning ====
 # Bind + CORS (restrict origins in prod!)
 Environment="OLLAMA_HOST=0.0.0.0:11434"
-Environment="OLLAMA_ORIGINS=*"
+Environment="OLLAMA_ORIGINS=http://10.0.0.7:*"
 
 # Concurrency + queue (start here; tune with load test)
-Environment="OLLAMA_NUM_PARALLEL=3"
+Environment="OLLAMA_NUM_PARALLEL=5"
 Environment="OLLAMA_MAX_QUEUE=15"
 
 # Keep single model hot in RAM
@@ -116,12 +132,62 @@ StandardError=append:/var/log/ollama/error.log
 WantedBy=multi-user.target
 ```
 
+Allow AI Services from private network to hit ollama:
+
+```
+Create the log directory:
+
+
+```
+
+sudo mkdir -p /var/log/ollama
+sudo chown ollama:ollama /var/log/ollama
+
+```
+Create the working directory:
+
+
+```
+
+sudo mkdir -p /var/lib/ollama
+sudo chown ollama:ollama /var/lib/ollama
+
+```
+Reload and restart the service:
+
+```
+
+sudo systemctl daemon-reload
+sudo systemctl restart ollama
+
+```
+
+
+# Enable UFW
+sudo ufw --force enable
+
+
+#allowing specific Ip address
+sudo ufw allow from 10.0.0.7 to any port 11434
+sudo ufw status
+
+az network nsg rule create \
+  --resource-group convonest-prod-ai \
+  --nsg-name ai-modelsNSG \
+  --name Allow-Ollama \
+  --priority 100 \
+  --source-address-prefixes 10.0.0.7/32 \
+  --destination-port-ranges 11434 \
+  --access Allow \
+  --protocol Tcp
+```
+
 Enable + start:
 
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable ollama
-sudo systemctl start ollama
+sudo systemctl restart ollama
 sudo systemctl status ollama --no-pager
 ```
 
