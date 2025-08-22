@@ -528,35 +528,55 @@ class VectorSearchService:
         max_length: int = 200,
     ) -> Dict[str, Any]:
         """
-        Generate an answer to the query using either Mistral (self-hosted) or Azure OpenAI Service.
+        Generate customer support answers with specific length constraints.
         """
         try:
             # Combine context
             context = "\n\n".join(contents)
-            token_limit = min(max_length // 4, 45)  # Approximate token limit
+            
+            # Calculate word/sentence targets based on max_length
+            target_words = max_length // 4  # Rough tokens to words conversion
+            
+            if target_words <= 25:
+                length_instruction = f"Answer in exactly 1-2 sentences (maximum {target_words} words)"
+                response_type = "brief"
+            elif target_words <= 50:
+                length_instruction = f"Answer in exactly 2-3 sentences (maximum {target_words} words)"
+                response_type = "concise"
+            elif target_words <= 100:
+                length_instruction = f"Answer in exactly 3-4 sentences (maximum {target_words} words)"
+                response_type = "standard"
+            else:
+                length_instruction = f"Answer in exactly 4-6 sentences (maximum {target_words} words)"
+                response_type = "detailed"
 
-            # System prompt
-            system_prompt = f"""CRITICAL INSTRUCTIONS:
-    1. You MUST ONLY answer based on the EXACT provided context
-    2. You MUST provide a BRIEF response - no more than {token_limit} tokens
-    3. Use a {tone} tone and be extremely concise
-    4. Only include the most essential details that directly answer the query
-    5. If the answer CANNOT be found in the context, respond with "Not provided in the context"
-    6. Do NOT add any explanations or information not present in the context
-    7. Do NOT exceed {token_limit} tokens in your response
-    8. Format your answer as a single paragraph with no bullet points or lists"""
+            # Clear, direct system prompt for customer support
+            system_prompt = f"""You are a customer support AI assistant. Your role is to provide accurate, helpful answers to customer questions.
 
-            # User prompt
-            user_prompt = f"""Reference content:
-    {context}
+STRICT REQUIREMENTS:
+1. ONLY use information from the provided context - never invent details
+2. {length_instruction}
+3. Write in {language} with a {tone} tone
+4. Give direct, actionable answers - no unnecessary explanations
+5. If information is not in the context, say "I don't have that information available"
+6. Always complete your sentences - never cut off mid-word
+7. Focus on answering the customer's specific question
 
-    Question: {query}
+RESPONSE FORMAT:
+- Start with a direct answer to the question
+- Include only essential details from the context
+- End with a complete sentence
+- Stay within the word limit"""
 
-    IMPORTANT: Provide a comprehensive answer based ONLY on information in the given context in {language} language.
-    Include ALL relevant policy details, time limits, conditions, or restrictions that apply to this question."""
+            # Simple, focused user prompt
+            user_prompt = f"""Context: {context}
+
+Customer Question: {query}
+
+Provide a {response_type} answer in {language} (maximum {target_words} words)."""
 
             if isMistralEnabledForFAQ:
-                # Prepare payload for Mistral
+                # Mistral API call with appropriate max_tokens
                 data = {
                     "model": MISTRAL_CONFIG['model'],
                     "messages": [
@@ -564,11 +584,13 @@ class VectorSearchService:
                         {"role": "user", "content": user_prompt}
                     ],
                     "stream": False,
-                    "max_tokens": max_length,
-                    "temperature": 0.2
+                    "max_tokens": max_length,  # Use full max_length
+                    "temperature": 0.2,  # Lower temperature for consistent support answers
+                    "stop": ["\n\nCustomer:", "\n\nQuestion:", "Context:"],  # Stop at natural breaks
                 }
 
-                logger.info("Sending context-constrained request to Mistral: %s", json.dumps(data, indent=2))
+                logger.info("Sending customer support request to Mistral: target_words=%d, max_tokens=%d", 
+                           target_words, max_length)
 
                 response = await self.http_client.post(
                     MISTRAL_CONFIG['chat_url'],
@@ -583,9 +605,12 @@ class VectorSearchService:
 
                 mistral_response = response.json()
                 
-                # Extract content from Mistral's response format
                 try:
-                    content = mistral_response["choices"][0]["message"]["content"]
+                    content = mistral_response["choices"][0]["message"]["content"].strip()
+                    
+                    # Simple validation and cleanup
+                    content = self._validate_support_response(content, target_words)
+                    
                     return {
                         "message": {
                             "content": content
@@ -596,28 +621,29 @@ class VectorSearchService:
                     return {"error": f"Unexpected Mistral response format: {str(e)}"}
 
             else:
-                # Call Azure OpenAI Service
+                # Azure OpenAI Service
                 azure_client = AzureOpenAIServiceClient()
 
-                logger.info("Sending context-constrained request to system_prompt: %s , user_prompt: %s", system_prompt, user_prompt)
+                logger.info("Sending customer support request to Azure: target_words=%d, max_tokens=%d", 
+                           target_words, max_length)
 
                 azure_response = await azure_client.generate_answer(
                     system_prompt=system_prompt,
                     user_prompt=user_prompt,
                     max_tokens=max_length,
-                    temperature=0.2,
-                    include_usage=False  # Keep costs minimal - only get content
+                    temperature=0.2,  # Consistent support responses
+                    include_usage=False
                 )
                 
-                # Clean up the client
                 await azure_client.close()
 
-                # Azure response is already in the format we need: {"content": "..."}
-                # Convert to match expected format
                 if "content" in azure_response:
+                    content = azure_response["content"].strip()
+                    content = self._validate_support_response(content, target_words)
+                    
                     return {
                         "message": {
-                            "content": azure_response["content"]
+                            "content": content
                         }
                     }
                 elif "error" in azure_response:
@@ -627,11 +653,42 @@ class VectorSearchService:
                     return {"error": f"Unexpected Azure response format"}
 
         except Exception as e:
-            logger.error(f"Error generating answer with LLM: {str(e)}", exc_info=True)
+            logger.error(f"Error generating customer support answer: {str(e)}", exc_info=True)
             return {"error": f"Error generating answer: {str(e)}"}
 
-
-
+    def _validate_support_response(self, content: str, target_words: int) -> str:
+        """
+        Simple validation for customer support responses.
+        """
+        try:
+            # Remove any extra whitespace
+            content = content.strip()
+            
+            # Ensure response ends with proper punctuation
+            if content and content[-1] not in '.!?':
+                # Find last complete sentence
+                last_punct = max(
+                    content.rfind('.'),
+                    content.rfind('!'), 
+                    content.rfind('?')
+                )
+                if last_punct > 0:
+                    content = content[:last_punct + 1]
+                else:
+                    # If no punctuation found, add a period
+                    content += '.'
+            
+            # Word count check (warn if significantly over)
+            word_count = len(content.split())
+            if word_count > target_words * 1.5:  # 50% over target
+                logger.warning(f"Response word count ({word_count}) significantly exceeds target ({target_words})")
+            
+            return content
+            
+        except Exception as e:
+            logger.warning(f"Error validating support response: {e}")
+            return content  # Return original if validation fails
+            
     async def process_search_request(
         self, 
         query: str, 
@@ -659,7 +716,7 @@ class VectorSearchService:
                 tenant_id,
                 top_k, 
                 threshold,
-                metadata_filters
+                metadata_filters,True,query
             ) 
         
         

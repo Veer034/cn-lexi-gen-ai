@@ -11,22 +11,6 @@ This guide configures a **Standard D8as v4** VM (8 vCPUs, 32 GiB RAM, no GPU) 
 - **Disk:** Premium SSD recommended, **/var/lib/ollama** on the fastest disk.
 - **Network:** Restrict access with NSG / firewall; avoid exposing the API to the public internet directly.
 
-```
-az vm create \
-  --resource-group convonest-prod \
-  --name ai-model \
-  --image Canonical:0001-com-ubuntu-server-jammy:22_04-lts-gen2:latest \
-  --size Standard_B2ms \
-  --admin-username azureuser \
-  --generate-ssh-keys \
-  --vnet-name data-services-vnet \
-  --subnet default \
-  --private-ip-address 10.0.0.8 \
-  --public-ip-sku Standard \
-  --storage-sku StandardSSD_LRS \
-  --os-disk-size-gb 64
-```
-
 ---
 
 ## 2) Install Ollama
@@ -102,29 +86,33 @@ Restart=always
 RestartSec=5
 StartLimitIntervalSec=0
 
-# ==== Ollama Tuning ====
-# Bind + CORS (restrict origins in prod!)
+# ==== Ollama Tuning for D8as_v4 (8 vCPUs, 32GB RAM) ====
+# Bind + CORS (adjust IP to your Python service VM)
 Environment="OLLAMA_HOST=0.0.0.0:11434"
-Environment="OLLAMA_ORIGINS=http://10.0.0.7:*"
+Environment="OLLAMA_ORIGINS=http://10.0.0.7:*,http://localhost:*"
 
-# Concurrency + queue (start here; tune with load test)
-Environment="OLLAMA_NUM_PARALLEL=5"
-Environment="OLLAMA_MAX_QUEUE=15"
+# Concurrency optimized for 8 vCPUs
+Environment="OLLAMA_NUM_PARALLEL=4"
+Environment="OLLAMA_MAX_QUEUE=12"
 
-# Keep single model hot in RAM
+# Memory management for 32GB RAM
 Environment="OLLAMA_MAX_LOADED_MODELS=1"
-Environment="OLLAMA_KEEP_ALIVE=1200"
+Environment="OLLAMA_KEEP_ALIVE=1800"  # 30 min (increased from 20 min)
 
-# CPU locality
+# CPU optimization for AMD EPYC
 Environment="OLLAMA_NUMA_PINNING=0"
+Environment="OLLAMA_CPU_THREADS=8"    # Use all 8 cores
 
-# CPU‑only note: FLASH_ATTENTION has no effect on CPU; omit it.
+# Memory allocation (leave ~18GB for model, rest for system)
+Environment="OLLAMA_MAX_VRAM=0"       # CPU-only mode
 
-# ==== Limits & Logs ====
+# ==== Resource Limits ====
 LimitNOFILE=65536
 LimitNPROC=4096
-LimitAS=14G
-LimitMEMLOCK=14G
+LimitAS=20G                           # Increased from 14G to 20G
+LimitMEMLOCK=18G                      # Model memory limit
+
+# ==== Logging ====
 StandardOutput=append:/var/log/ollama/service.log
 StandardError=append:/var/log/ollama/error.log
 
