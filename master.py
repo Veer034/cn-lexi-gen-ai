@@ -290,7 +290,7 @@ class VectorSearchService:
 
 
 
-    async def search_elasticsearch_with_dynamic_keywords(
+    async def search_elasticsearch_with_enhanced_chunking(
         self, 
         embedding: List[float], 
         tenant_id: str, 
@@ -300,9 +300,11 @@ class VectorSearchService:
         include_context: bool = True,
         original_query: Optional[str] = None
     ) -> List[Dict[str, Any]]:
-        """Enhanced search with context preservation and hybrid matching"""
+        """
+        Enhanced search that works with improved chunking but keeps interface simple
+        """
         try:
-            # Build the filter conditions
+            # Build basic filter conditions
             filter_conditions = [{"term": {"tenantId": tenant_id}}]
             
             # Add metadata filters if provided
@@ -313,15 +315,15 @@ class VectorSearchService:
                     else:
                         filter_conditions.append({"term": {f"metadata.{key}": value}})
             
-            # Build query based on whether we have original text
+            # Build query - hybrid if we have original text, semantic-only otherwise
             if original_query:
-                # Hybrid search: semantic + keyword
+                # Hybrid search: semantic + keyword (simple version)
                 query = {
                     "query": {
                         "bool": {
                             "filter": filter_conditions,
                             "should": [
-                                # Semantic search with normalized scoring (FIX HERE)
+                                # Semantic search with normalized scoring
                                 {
                                     "script_score": {
                                         "query": {"match_all": {}},
@@ -332,11 +334,11 @@ class VectorSearchService:
                                         "boost": 2.0
                                     }
                                 },
-                                # Keyword search for exact matches
+                                # Simple keyword search
                                 {
                                     "multi_match": {
                                         "query": original_query,
-                                        "fields": ["content^2", "keywords^1.5", "contextSummary"],
+                                        "fields": ["content^2", "keywords^1.5", "sectionTitle"],
                                         "type": "best_fields",
                                         "boost": 1.0
                                     }
@@ -345,7 +347,7 @@ class VectorSearchService:
                                 {
                                     "bool": {
                                         "must": [
-                                            {"term": {"chunkType": "faq"}},
+                                            {"wildcard": {"chunkType": "*faq*"}},
                                             {"match": {"content": original_query}}
                                         ],
                                         "boost": 1.5 if self._is_question(original_query) else 1.0
@@ -358,7 +360,7 @@ class VectorSearchService:
                     "_source": ["content", "documentId", "chunkPosition", "totalChunks", "sectionTitle", "keywords", "metadata", "chunkType"]
                 }
             else:
-                # Fallback to semantic-only search with normalized scoring (FIX HERE)
+                # Semantic-only search
                 query = {
                     "query": {
                         "script_score": {
@@ -376,8 +378,7 @@ class VectorSearchService:
                     "_source": ["content", "documentId", "chunkPosition", "totalChunks", "sectionTitle", "keywords", "metadata", "chunkType"]
                 }
 
-            logger.info(f"Enhanced query with original_query: {bool(original_query)}")
-            logger.info(f"ES query: {query}")
+            logger.info(f"Enhanced search with original_query: {bool(original_query)}")
             
             # Execute search
             response = await self.es_client.search(
@@ -386,14 +387,14 @@ class VectorSearchService:
                 size=top_k
             )
             
-            # Process results
+            # Process results - keep it simple
             results = {
                 "esTime": response['took'],
                 "contents": []
             }
             
             if include_context:
-                # Enhanced processing with adjacent context
+                # Get chunks with basic adjacent context (existing logic)
                 for hit in response['hits']['hits']:
                     score = hit['_score']
                     if score >= threshold:
@@ -403,7 +404,7 @@ class VectorSearchService:
                         )
                         results["contents"].append(enhanced_content)
             else:
-                # Original processing (backward compatibility)
+                # Simple content only
                 for hit in response['hits']['hits']:
                     score = hit['_score']
                     if score >= threshold:
@@ -414,7 +415,91 @@ class VectorSearchService:
         except Exception as e:
             logger.error(f"Error searching Elasticsearch: {str(e)}", exc_info=True)
             raise
-        
+
+    async def _get_chunk_with_adjacent_context(
+            self, 
+            chunk_source: Dict[str, Any], 
+            tenant_id: str
+        ) -> Dict[str, Any]:
+        """
+        Get chunk content with adjacent context - simplified version
+        """
+        try:
+            document_id = chunk_source.get('documentId')
+            current_position = chunk_source.get('chunkPosition', 0)
+            total_chunks = chunk_source.get('totalChunks', 1)
+            
+            base_content = {
+                'content': chunk_source['content'],
+                'sectionTitle': chunk_source.get('sectionTitle', ''),
+                'chunkPosition': current_position,
+                'totalChunks': total_chunks,
+                'documentId': document_id,
+                'metadata': chunk_source.get('metadata', {})
+            }
+            
+            # Only get adjacent context if we have multiple chunks and it's not already consolidated
+            chunk_type = chunk_source.get('chunkType', '')
+            if total_chunks > 1 and not chunk_type.endswith('_consolidated'):
+                # Get previous and next chunk for context
+                adjacent_positions = []
+                if current_position > 0:
+                    adjacent_positions.append(current_position - 1)
+                if current_position < total_chunks - 1:
+                    adjacent_positions.append(current_position + 1)
+                
+                if adjacent_positions:
+                    adjacent_query = {
+                        "query": {
+                            "bool": {
+                                "must": [
+                                    {"term": {"tenantId": tenant_id}},
+                                    {"term": {"documentId": document_id}},
+                                    {"terms": {"chunkPosition": adjacent_positions}}
+                                ]
+                            }
+                        },
+                        "_source": ["content", "chunkPosition"],
+                        "sort": [{"chunkPosition": {"order": "asc"}}],
+                        "size": 2
+                    }
+                    
+                    try:
+                        adjacent_response = await self.es_client.search(
+                            index=ES_CONFIG['tenant_document_index_name'],
+                            body=adjacent_query
+                        )
+                        
+                        # Simple context addition
+                        context_parts = [base_content['content']]
+                        
+                        for hit in adjacent_response['hits']['hits']:
+                            pos = hit['_source']['chunkPosition']
+                            content = hit['_source']['content']
+                            
+                            if pos < current_position:
+                                context_parts.insert(0, content[-200:])  # Previous context
+                            elif pos > current_position:
+                                context_parts.append(content[:200])     # Next context
+                        
+                        # Combine with simple separators
+                        if len(context_parts) > 1:
+                            base_content['content'] = ' ... '.join(context_parts)
+                            
+                    except Exception as e:
+                        logger.warning(f"Could not fetch adjacent context: {str(e)}")
+            
+            return base_content
+            
+        except Exception as e:
+            logger.error(f"Error getting chunk with context: {str(e)}")
+            return {
+                'content': chunk_source.get('content', ''),
+                'sectionTitle': chunk_source.get('sectionTitle', ''),
+                'documentId': chunk_source.get('documentId', ''),
+                'metadata': chunk_source.get('metadata', {})
+            }
+
 
     def _is_question(self, query: str) -> bool:
         """Check if query is a question"""
@@ -711,12 +796,12 @@ Provide a {response_type} answer in {language} (maximum {target_words} words).""
             metadata_filters["language"] = language
                 
         # Create tasks for concurrent Elasticsearch searches
-        search_result = await self.search_elasticsearch_with_dynamic_keywords(
+        search_result = await self.search_elasticsearch_with_enhanced_chunking(
                 embedding, 
                 tenant_id,
                 top_k, 
                 threshold,
-                metadata_filters,True,query
+                metadata_filters,True
             ) 
         
         

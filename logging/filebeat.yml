@@ -25,9 +25,9 @@ filebeat.inputs:
       input_type: "systemd_logs"
     fields_under_root: true
 
-setup.template.name: ""
-setup.template.pattern: ""
+# Completely disable template and ILM management
 setup.template.enabled: false
+setup.ilm.enabled: false
 
 processors:
   - script:
@@ -37,7 +37,6 @@ processors:
         function process(event) {
           var serviceName = "unknown";
           var trackingId = "NA";
-          var indexName = "ai-service-logs";
           
           var inputType = event.Get("input_type") || "unknown";
           if (inputType === "application_logs") {
@@ -75,15 +74,10 @@ processors:
           event.Put("tracking_id", trackingId);
           event.Put("log_message", message);
           event.Put("log_level", logLevel);
-
-          event.Put("@metadata.index", indexName);
-          event.Delete("@metadata._index");
-          event.Delete("@metadata.beat");
-          event.Delete("@metadata.type");
-          event.Delete("@metadata.version");
         }
   - drop_fields:
       fields: ["message"]
+
 output.elasticsearch:
   hosts:
     - "https://10.0.0.4:9200"
@@ -95,9 +89,7 @@ output.elasticsearch:
     certificate_authorities:
       - "/usr/local/share/ca-certificates/elasticsearch.crt"
     verification_mode: certificate
-  index: "%{[@metadata.index]}"
-  template.name: ""
-  template.pattern: ""
+  index: "ai-service-logs-%{+yyyy-MM}"
   template.enabled: false
   ilm.enabled: false
   loadbalance: true
