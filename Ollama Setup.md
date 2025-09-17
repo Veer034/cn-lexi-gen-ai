@@ -86,35 +86,46 @@ Restart=always
 RestartSec=5
 StartLimitIntervalSec=0
 
-# ==== Ollama Tuning for D8as_v4 (8 vCPUs, 32GB RAM) ====
-# Bind + CORS (adjust IP to your Python service VM)
+# ==== Ollama Tuning for Azure E8as v4 (8 vCPUs, 32GB RAM) ====
+# Network configuration
 Environment="OLLAMA_HOST=0.0.0.0:11434"
 Environment="OLLAMA_ORIGINS=http://10.0.0.7:*,http://localhost:*"
 
-# Concurrency optimized for 8 vCPUs
-Environment="OLLAMA_NUM_PARALLEL=4"
-Environment="OLLAMA_MAX_QUEUE=12"
+# Concurrency optimized for multiple concurrent requests
+Environment="OLLAMA_NUM_PARALLEL=6"      # Increased from 4 (better for 8 vCPUs)
+Environment="OLLAMA_MAX_QUEUE=20"        # Increased queue size
 
 # Memory management for 32GB RAM
 Environment="OLLAMA_MAX_LOADED_MODELS=1"
-Environment="OLLAMA_KEEP_ALIVE=1800"  # 30 min (increased from 20 min)
+Environment="OLLAMA_KEEP_ALIVE=1800"     # 30 min cache
 
-# CPU optimization for AMD EPYC
+# CPU optimization - reserve cores for concurrency
 Environment="OLLAMA_NUMA_PINNING=0"
-Environment="OLLAMA_CPU_THREADS=8"    # Use all 8 cores
+Environment="OLLAMA_CPU_THREADS=4"       # Use 4 cores per request (allows 2 concurrent)
 
-# Memory allocation (leave ~18GB for model, rest for system)
-Environment="OLLAMA_MAX_VRAM=0"       # CPU-only mode
+# Memory allocation (more conservative)
+Environment="OLLAMA_MAX_VRAM=0"          # CPU-only mode
 
-# ==== Resource Limits ====
+# Model-specific memory control
+Environment="OLLAMA_FLASH_ATTENTION=1"   # Enable flash attention for efficiency
+Environment="OLLAMA_KV_CACHE_TYPE=f16"   # Use f16 for KV cache to save memory
+
+# ==== Resource Limits (More realistic for 32GB) ====
 LimitNOFILE=65536
-LimitNPROC=4096
-LimitAS=20G                           # Increased from 14G to 20G
-LimitMEMLOCK=18G                      # Model memory limit
+LimitNPROC=8192                          # Increased for more threads
+LimitAS=28G                              # Use more of available 32GB
+LimitMEMLOCK=24G                         # Allow more memory for models
+LimitCORE=0                              # Disable core dumps to save space
+
+# ==== Performance Tuning ====
+# Disable swap usage for better performance
+Environment="OLLAMA_MMAP_DISABLE=0"      # Keep mmap enabled
+Environment="OLLAMA_TMPDIR=/tmp/ollama"   # Use fast temp directory
 
 # ==== Logging ====
 StandardOutput=append:/var/log/ollama/service.log
 StandardError=append:/var/log/ollama/error.log
+SyslogIdentifier=ollama
 
 [Install]
 WantedBy=multi-user.target

@@ -2,7 +2,7 @@ import datetime
 import json
 import os
 import uuid
-import logging
+import random
 import uvicorn
 from typing import List, Dict, Any, Optional
 import asyncio
@@ -16,7 +16,7 @@ from confluent_kafka import Producer
 import httpx
 from config import KAFKA_CONFIG, ES_CONFIG, MISTRAL_CONFIG
 from pythonjsonlogger import jsonlogger
-from response import ExtractionAnalyticsDto
+from response import AIGeneratedSearchResultDto
 from manalLangaugeDetection import ManualLanguageDetector
 from libaryLanguage import LibraryLanguageDetector
 from logger_config import tracking_id_var, get_logger
@@ -604,64 +604,81 @@ class VectorSearchService:
             return chunk_data.get('content', '')
 
 
+    def get_model_driven_token_allocation(self, language: str, base_tokens: int) -> dict:
+        """
+        Give model flexible token ranges to decide appropriate response length
+        """
+    
+        
+        # Apply language multiplier
+        multiplier = self.get_language_token_multiplier(language)
+        max_tokens = int(base_tokens * multiplier)
+        
+        # Set reasonable caps
+        max_tokens = min(max_tokens, 500)  # Hard cap to control costs
+        
+        return {
+            "max_tokens": max_tokens,
+            "multiplier": multiplier
+        }
+
+    def create_intelligent_system_prompt(self, language: str, tone: str, max_tokens: int) -> str:
+        """
+        Create system prompt that lets model decide response length based on query
+        """
+        language_name = self.manualDetector.supported_languages.get(language, {}).get('name', 'English')
+        
+        return f"""You are a customer support AI assistant. Your role is to provide accurate, helpful answers to customer questions.
+
+    STRICT REQUIREMENTS:
+    1. ONLY use information from the provided context - never invent details
+    2. Write in {language_name} with a {tone} tone
+    3. DECIDE THE APPROPRIATE RESPONSE LENGTH based on what the user is asking:
+    - If user asks for brief/quick/short answer: Give 1-2 sentences
+    - If user asks for detailed/comprehensive explanation: Give complete explanation
+    - For regular questions: Give appropriately detailed response (2-4 sentences typically)
+    4. Maximum limit: {max_tokens} tokens - never exceed this
+    5. Give direct, actionable answers
+    6. If information is not in the context, return exactly: "NO_ANSWER_FOUND"
+    7. Always complete your sentences - never cut off mid-word
+    8. Focus on answering the customer's specific question"""
+
     async def generate_answer_from_mistral_or_azure(
         self,
         query: str,
         contents: List[str],
-        language: str,
+        language: str,  
         tone: str = "polite",
         max_length: int = 200,
     ) -> Dict[str, Any]:
         """
-        Generate customer support answers with specific length constraints.
+        Generate customer support answers with model-driven length decisions.
         """
         try:
+
+            # Get model-driven token allocation
+            token_info = self.get_model_driven_token_allocation(language,max_length)
+            max_tokens = token_info["max_tokens"]
+            
             # Combine context
             context = "\n\n".join(contents)
             
-            # Calculate word/sentence targets based on max_length
-            target_words = max_length // 4  # Rough tokens to words conversion
+            # Let model decide response length based on user query
+            system_prompt = self.create_intelligent_system_prompt(language, tone, max_tokens)
             
-            if target_words <= 25:
-                length_instruction = f"Answer in exactly 1-2 sentences (maximum {target_words} words)"
-                response_type = "brief"
-            elif target_words <= 50:
-                length_instruction = f"Answer in exactly 2-3 sentences (maximum {target_words} words)"
-                response_type = "concise"
-            elif target_words <= 100:
-                length_instruction = f"Answer in exactly 3-4 sentences (maximum {target_words} words)"
-                response_type = "standard"
-            else:
-                length_instruction = f"Answer in exactly 4-6 sentences (maximum {target_words} words)"
-                response_type = "detailed"
-
-            # Clear, direct system prompt for customer support
-            system_prompt = f"""You are a customer support AI assistant. Your role is to provide accurate, helpful answers to customer questions.
-
-STRICT REQUIREMENTS:
-1. ONLY use information from the provided context - never invent details
-2. {length_instruction}
-3. Write in {language} with a {tone} tone
-4. Give direct, actionable answers - no unnecessary explanations
-5. If information is not in the context, say "I don't have that information available"
-6. Always complete your sentences - never cut off mid-word
-7. Focus on answering the customer's specific question
-
-RESPONSE FORMAT:
-- Start with a direct answer to the question
-- Include only essential details from the context
-- End with a complete sentence
-- Stay within the word limit"""
-
-            # Simple, focused user prompt
+            # Simple user prompt - let model analyze the query
             user_prompt = f"""Context: {context}
 
-Customer Question: {query}
+    Customer Question: {query}
 
-Provide a {response_type} answer in {language} (maximum {target_words} words)."""
+    Provide an appropriate response in {self.manualDetector.supported_languages.get(language, {}).get('name', 'English')}."""
+
+            # Log the parameters
+            logger.info("Model-driven request: language=%s, max_tokens=%d, multiplier=%.1f", 
+                    language, max_length, token_info["multiplier"])
 
             if isMistralEnabledForFAQ:
-                # Mistral API call with appropriate max_tokens
+                # Mistral API call
                 data = {
                     "model": MISTRAL_CONFIG['model'],
                     "messages": [
@@ -669,13 +686,10 @@ Provide a {response_type} answer in {language} (maximum {target_words} words).""
                         {"role": "user", "content": user_prompt}
                     ],
                     "stream": False,
-                    "max_tokens": max_length,  # Use full max_length
-                    "temperature": 0.2,  # Lower temperature for consistent support answers
-                    "stop": ["\n\nCustomer:", "\n\nQuestion:", "Context:"],  # Stop at natural breaks
+                    "max_tokens": max_tokens,
+                    "temperature": 0.2,
+                    "stop": ["\n\nCustomer:", "\n\nQuestion:", "Context:"],
                 }
-
-                logger.info("Sending customer support request to Mistral: target_words=%d, max_tokens=%d", 
-                           target_words, max_length)
 
                 response = await self.http_client.post(
                     MISTRAL_CONFIG['chat_url'],
@@ -693,9 +707,6 @@ Provide a {response_type} answer in {language} (maximum {target_words} words).""
                 try:
                     content = mistral_response["choices"][0]["message"]["content"].strip()
                     
-                    # Simple validation and cleanup
-                    content = self._validate_support_response(content, target_words)
-                    
                     return {
                         "message": {
                             "content": content
@@ -709,22 +720,20 @@ Provide a {response_type} answer in {language} (maximum {target_words} words).""
                 # Azure OpenAI Service
                 azure_client = AzureOpenAIServiceClient()
 
-                logger.info("Sending customer support request to Azure: target_words=%d, max_tokens=%d", 
-                           target_words, max_length)
-
+                logger.info(f" system_prompt : {system_prompt} , user_prompt: {user_prompt}, max_tokens : {max_tokens}")
                 azure_response = await azure_client.generate_answer(
                     system_prompt=system_prompt,
                     user_prompt=user_prompt,
-                    max_tokens=max_length,
-                    temperature=0.2,  # Consistent support responses
+                    max_tokens=max_tokens,
+                    temperature=0.2,
                     include_usage=False
                 )
+                logger.info(f" azure_response: {azure_response}")
                 
                 await azure_client.close()
-
+                
                 if "content" in azure_response:
                     content = azure_response["content"].strip()
-                    content = self._validate_support_response(content, target_words)
                     
                     return {
                         "message": {
@@ -741,39 +750,131 @@ Provide a {response_type} answer in {language} (maximum {target_words} words).""
             logger.error(f"Error generating customer support answer: {str(e)}", exc_info=True)
             return {"error": f"Error generating answer: {str(e)}"}
 
-    def _validate_support_response(self, content: str, target_words: int) -> str:
+
+    def get_language_token_multiplier(self, language: str) -> float:
         """
-        Simple validation for customer support responses.
+        Get token multiplier based on language efficiency using language codes
         """
-        try:
-            # Remove any extra whitespace
-            content = content.strip()
-            
-            # Ensure response ends with proper punctuation
-            if content and content[-1] not in '.!?':
-                # Find last complete sentence
-                last_punct = max(
-                    content.rfind('.'),
-                    content.rfind('!'), 
-                    content.rfind('?')
-                )
-                if last_punct > 0:
-                    content = content[:last_punct + 1]
-                else:
-                    # If no punctuation found, add a period
-                    content += '.'
-            
-            # Word count check (warn if significantly over)
-            word_count = len(content.split())
-            if word_count > target_words * 1.5:  # 50% over target
-                logger.warning(f"Response word count ({word_count}) significantly exceeds target ({target_words})")
-            
-            return content
-            
-        except Exception as e:
-            logger.warning(f"Error validating support response: {e}")
-            return content  # Return original if validation fails
-            
+        language = language.lower()
+        
+        # High efficiency languages (fewer tokens needed)
+        high_efficiency = {
+            'en': 1.0,    # English
+            'es': 1.1,    # Spanish
+            'fr': 1.1,    # French
+            'pt': 1.1,    # Portuguese
+            'it': 1.1,    # Italian
+            'ca': 1.1,    # Catalan
+            'gl': 1.1,    # Galician
+            'de': 1.2,    # German
+            'nl': 1.2,    # Dutch
+            'sv': 1.2,    # Swedish
+            'da': 1.2,    # Danish
+            'no': 1.2,    # Norwegian
+            'af': 1.2,    # Afrikaans
+        }
+        
+        # Medium efficiency languages
+        medium_efficiency = {
+            'ru': 1.4,    # Russian
+            'uk': 1.4,    # Ukrainian
+            'pl': 1.4,    # Polish
+            'cs': 1.4,    # Czech
+            'sk': 1.4,    # Slovak
+            'sl': 1.4,    # Slovenian
+            'hr': 1.4,    # Croatian
+            'bs': 1.4,    # Bosnian
+            'sr': 1.4,    # Serbian
+            'bg': 1.4,    # Bulgarian
+            'mk': 1.4,    # Macedonian
+            'ro': 1.4,    # Romanian
+            'hu': 1.4,    # Hungarian
+            'fi': 1.4,    # Finnish
+            'lt': 1.4,    # Lithuanian
+            'tr': 1.4,    # Turkish
+            'az': 1.4,    # Azerbaijani
+            'kk': 1.4,    # Kazakh
+            'sq': 1.4,    # Albanian
+            'he': 1.5,    # Hebrew
+            'el': 1.5,    # Greek
+            'fa': 1.5,    # Persian
+            'id': 1.3,    # Indonesian
+            'ms': 1.3,    # Malay
+            'vi': 1.8,    # Vietnamese
+        }
+        
+        # Lower efficiency languages (more tokens needed)
+        lower_efficiency = {
+            'ar': 1.8,    # Arabic
+            'ur': 1.8,    # Urdu
+            'ps': 1.8,    # Pashto
+            'sd': 1.8,    # Sindhi
+            'hi': 1.8,    # Hindi
+            'bn': 1.9,    # Bengali
+            'pa': 1.8,    # Punjabi
+            'gu': 1.8,    # Gujarati
+            'mr': 1.8,    # Marathi
+            'ne': 1.8,    # Nepali
+            'si': 1.9,    # Sinhala
+            'ta': 1.9,    # Tamil
+            'te': 1.9,    # Telugu
+            'ml': 1.9,    # Malayalam
+            'kn': 1.9,    # Kannada
+            'zh': 2.0,    # Chinese (Simplified)
+            'zh-tw': 2.0, # Chinese (Traditional)
+            'ja': 2.2,    # Japanese
+            'ko': 2.0,    # Korean
+            'th': 2.2,    # Thai
+            'sw': 1.6,    # Swahili
+            'ha': 1.6,    # Hausa
+            'ig': 1.6,    # Igbo
+            'ak': 1.6,    # Akan
+            'tw': 1.6,    # Twi
+        }
+        
+        return (high_efficiency.get(language) or 
+                medium_efficiency.get(language) or 
+                lower_efficiency.get(language) or 
+                1.5)  # Default for unknown languages
+
+    def get_language_aware_token_length(self, base_tokens: int, language: str) -> int:
+        """
+        Adjust token length based on language characteristics using language codes
+        """
+        multiplier = self.get_language_token_multiplier(language)
+        adjusted_tokens = int(base_tokens * multiplier)
+        
+        # Cap maximum tokens to prevent excessive costs
+        max_allowed = 800
+        return min(adjusted_tokens, max_allowed)
+
+    def get_language_length_instruction(self, max_length: int, language: str, target_words: int) -> str:
+        """
+        Get appropriate length instruction based on language characteristics
+        """
+        language = language.lower()
+        
+        # Character-based languages
+        if language in ['zh', 'zh-tw', 'ja', 'ko', 'th']:
+            target_chars = max_length * 2
+            if max_length <= 100:
+                return f"Answer in 1-2 clear sentences (maximum {target_chars} characters)"
+            elif max_length <= 200:
+                return f"Answer in 2-3 sentences (maximum {target_chars} characters)"
+            else:
+                return f"Answer in 3-4 sentences (maximum {target_chars} characters)"
+        
+        # Word-based languages (all others)
+        else:
+            if max_length <= 100:
+                return f"Answer in 1-2 clear sentences (maximum {target_words} words)"
+            elif max_length <= 250:
+                return f"Answer in 2-3 sentences (maximum {target_words} words)"
+            else:
+                return f"Answer in 3-4 sentences (maximum {target_words} words)"
+
+
+         
     async def process_search_request(
         self, 
         query: str, 
@@ -848,8 +949,18 @@ Provide a {response_type} answer in {language} (maximum {target_words} words).""
 
         return search_result  # Returning updated search_result
         
+    def get_no_results_response(self, language_code: str) -> str:
+        """
+        Get random no-results response in the user's language
+        """
+        # Default to English if language not found
+        responses = self.manualDetector.no_results_responses.get(language_code, self.no_results_responses.get('en', [
+            "I'm sorry, but I couldn't find an answer. Could you rephrase?"
+        ]))
+    
+        return random.choice(responses)
 
-    async def publish_analytics_report_to_kafka(self, tenant_id:str, topic: str, analyticsDto: ExtractionAnalyticsDto):
+    async def publish_analytics_report_to_kafka(self, tenant_id:str, topic: str, analyticsDto: AIGeneratedSearchResultDto):
         """
         Publishes analytics data to a Kafka topic.
         """
@@ -1041,11 +1152,12 @@ async def search(
         
          # Extract analytics data from response if it has mistral performance metrics
         if responseData and isinstance(responseData, dict) and 'total_duration' in responseData:
-            analytics_data = ExtractionAnalyticsDto(
+            analytics_data = AIGeneratedSearchResultDto(
                 tenantId=request.tenantId,
                 query=request.query,
                 answer=  responseData.get("answer",''),
                 contents = responseData.get('contents', []),
+                documentId= responseData.get('documentId', ''), 
                 totalDuration=responseData.get('total_duration', 0),
                 loadDuration=responseData.get('load_duration', 0),
                 promptEvalDuration=responseData.get('prompt_eval_duration', 0),
@@ -1064,7 +1176,7 @@ async def search(
         
 
         answer  = responseData.get('answer')
-        if answer == '':
+        if not answer or answer == "NO_ANSWER_FOUND" or answer == '""' or answer == '':
             language = request.language.lower()  # Get language from request
             answer = search_service.get_best_response(language)
        

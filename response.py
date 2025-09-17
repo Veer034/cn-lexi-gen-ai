@@ -4,11 +4,12 @@ from pydantic import BaseModel, Field
 import datetime
 
 
-class ExtractionAnalyticsDto(BaseModel):
+class AIGeneratedSearchResultDto(BaseModel):
     tenantId: str
     query: str
     answer: str
     contents: List[str]
+    documentId: str
     totalDuration: int
     loadDuration: int
     promptEvalDuration: int
