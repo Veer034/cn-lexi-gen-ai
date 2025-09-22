@@ -703,9 +703,15 @@ class VectorSearchService:
                     return {"error": f"Mistral LLM returned status {response.status_code}"}
 
                 mistral_response = response.json()
+                logger.info(f"mistral_response : {mistral_response}")
                 
                 try:
-                    content = mistral_response["choices"][0]["message"]["content"].strip()
+                    # Handle both Ollama and OpenAI-compatible response formats
+                    content = ""
+                    
+                    # Check if it's Ollama format (has 'message' key directly)
+                    if "message" in mistral_response and "content" in mistral_response["message"]:
+                        content = mistral_response["message"]["content"].strip()
                     
                     return {
                         "message": {
@@ -714,8 +720,12 @@ class VectorSearchService:
                     }
                 except (KeyError, IndexError) as e:
                     logger.error(f"Unexpected Mistral response format: {mistral_response}")
-                    return {"error": f"Unexpected Mistral response format: {str(e)}"}
-
+                    return {
+                        "message": {
+                            "content": content
+                        }
+                    }
+                
             else:
                 # Azure OpenAI Service
                 azure_client = AzureOpenAIServiceClient()
@@ -1176,12 +1186,13 @@ async def search(
         
 
         answer  = responseData.get('answer')
+        content_size = len(responseData.get("contents", []))
+        print(content_size)
         if not answer or answer == "NO_ANSWER_FOUND" or answer == '""' or answer == '':
             language = request.language.lower()  # Get language from request
             answer = search_service.get_best_response(language)
-       
-        content_size = len(responseData.get("contents", []))
-        print(content_size)
+            content_size = 0;
+        
 
         logger.info(f"[{tracking_id}] Search completed successfully")
         return AISearchResultDto(isGreeting =False, result=answer, requestId=tracking_id, contentSize =content_size)
