@@ -26,7 +26,8 @@ RUN pip install --no-cache-dir \
     gunicorn==21.2.0 \
     pydantic==2.5.2 \
     aiokafka==0.10.0 \
-    asyncio==3.4.3
+    asyncio==3.4.3 \
+    psutil==5.9.8
 
 # Install regex with a version that satisfies all requirements
 RUN pip install --no-cache-dir regex==2022.10.31

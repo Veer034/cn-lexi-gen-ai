@@ -40,7 +40,7 @@ Install library in local VM
     pip install openai
 
 
-    pip install "numpy<2.0.0"  sentence-transformers torch elasticsearch confluent-kafka httpx aiohttp python-json-logger transformers python-dotenv nltk langdetect fastapi uvicorn gunicorn pydantic asyncio  fasttext regex
+    pip install "numpy<2.0.0"  sentence-transformers torch elasticsearch confluent-kafka httpx aiohttp python-json-logger transformers python-dotenv nltk langdetect fastapi uvicorn gunicorn pydantic asyncio  fasttext regex psutil
 
     #For language detection
     pip install langdetect fasttext lingua-language-detector pycld2 polyglot

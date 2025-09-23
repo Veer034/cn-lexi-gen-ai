@@ -8,12 +8,14 @@ from typing import List, Dict, Any, Optional
 import asyncio
 import numpy as np
 import torch
+import psutil  # Import at top level
 from fastapi import FastAPI, HTTPException, Depends, Request
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
 from elasticsearch import AsyncElasticsearch
 from confluent_kafka import Producer
 import httpx
+from asyncio import Semaphore
 from config import KAFKA_CONFIG, ES_CONFIG, MISTRAL_CONFIG
 from pythonjsonlogger import jsonlogger
 from response import AIGeneratedSearchResultDto
@@ -22,14 +24,14 @@ from libaryLanguage import LibraryLanguageDetector
 from logger_config import tracking_id_var, get_logger
 from azure_openai_client import AzureOpenAIServiceClient
 
-
 from logger_config import get_logger
 logger = get_logger(__name__)
 
 # Initialize app
 app = FastAPI(title="Vector Search Service")
 
-isMistralEnabledForFAQ = MISTRAL_CONFIG['enabledForFAQ'];
+isMistralEnabledForFAQ = MISTRAL_CONFIG['enabledForFAQ']
+
 # For Getting trackingId
 @app.middleware("http")
 async def add_tracking_id_middleware(request: Request, call_next):
@@ -39,12 +41,11 @@ async def add_tracking_id_middleware(request: Request, call_next):
     response = await call_next(request)
     return response
 
-
 # Define request and response models
 class AISearchRequest(BaseModel):
     query: str
     tenantId: str
-    language:  str  
+    language: str  
     topK: int = 5
     threshold: float = 0.7
     metadataFilters: Optional[Dict[str, Any]] = None
@@ -57,11 +58,6 @@ class AISearchResultDto(BaseModel):
     requestId: str
     contentSize: int
 
-
-
-
-
-
 class AsyncKafkaProducer:
     """Wrapper for Kafka producer with async interface"""
     def __init__(self, bootstrap_servers):
@@ -69,7 +65,6 @@ class AsyncKafkaProducer:
             'bootstrap.servers': bootstrap_servers
         })
         self.is_connected = True
-
 
     async def send(self, topic, key=None, value=None):
         return await asyncio.to_thread(
@@ -92,7 +87,7 @@ class AsyncKafkaProducer:
                 tracking_id_str = tracking_id.decode("utf-8")
             else:
                 tracking_id_str = str(tracking_id)
-            self.producer.produce(topic, key=key, value=value, callback=callback,  headers=[("X-Tracking-ID", tracking_id_str)] )
+            self.producer.produce(topic, key=key, value=value, callback=callback, headers=[("X-Tracking-ID", tracking_id_str)])
             self.producer.flush()
             return True
         except Exception as e:
@@ -111,6 +106,19 @@ class VectorSearchService:
 
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         logger.info(f"🖥️ Using device: {self.device}")
+        
+        # CPU concurrency controls for F16 VM (16 cores, 32GB RAM)
+        if self.device == 'cpu':
+            # Conservative limits for CPU-only processing
+            self.embedding_semaphore = Semaphore(4)   # Max 4 concurrent embeddings
+            self.processing_semaphore = Semaphore(8)  # Max 8 total concurrent requests
+            logger.info("⚙️ CPU concurrency controls initialized: 4 embedding slots, 8 processing slots")
+        else:
+            # More aggressive limits for GPU
+            self.embedding_semaphore = Semaphore(10)
+            self.processing_semaphore = Semaphore(20)
+            logger.info("⚙️ GPU concurrency controls initialized: 10 embedding slots, 20 processing slots")
+        
         # Initialize SentenceTransformer
         model_name = 'paraphrase-multilingual-mpnet-base-v2'
         # model_path = models_path or os.path.join(os.getcwd(), 'models', 'sentence_transformer')
@@ -122,22 +130,22 @@ class VectorSearchService:
                 logger.info("✅ Local model loaded successfully")
             else:
                 logger.info(f"🌐 Loading model {model_name} from Hugging Face...")
-                self.st_model = SentenceTransformer(model_name)
+                self.st_model = SentenceTransformer(model_name, device=self.device)
                 logger.info("✅ Hugging Face model loaded successfully")
 
-              # CRITICAL: Set model to evaluation mode and optimize
+            # CRITICAL: Set model to evaluation mode and optimize
             self.st_model.eval()
             
             # Enable optimizations for inference
             if hasattr(torch, 'set_grad_enabled'):
                 torch.set_grad_enabled(False)  # Disable gradients for inference
-          
+                logger.info("🔧 Torch gradients disabled for inference optimization")
             
         except Exception as e:
             logger.error(f"❌ Error loading sentence transformer model: {e}")
             raise
         
-        # Initialize async Elasticsearch client
+        # Initialize async Elasticsearch client with connection pooling
         logger.info("🔍 Initializing Elasticsearch client...")
         self.es_client = AsyncElasticsearch(
             ES_CONFIG['hosts'],
@@ -146,13 +154,17 @@ class VectorSearchService:
             ssl_show_warn=ES_CONFIG.get('ssl_show_warn', True),
             ca_certs=ES_CONFIG.get('ca_certs'),
             retry_on_timeout=True,
-            max_retries=3
+            max_retries=3,
+            connections_per_node=50,  
         )
         logger.info("✅ Elasticsearch client initialized")
         
-        # Initialize HTTP client for API calls
+        # Initialize HTTP client for API calls with connection pooling
         logger.info("🌐 Initializing HTTP client...")
-        self.http_client = httpx.AsyncClient(timeout=300.0)
+        self.http_client = httpx.AsyncClient(
+            timeout=300.0,
+            limits=httpx.Limits(max_connections=100, max_keepalive_connections=20)
+        )
         logger.info("✅ HTTP client initialized")
         
         # Initialize Kafka producer for async processing results
@@ -161,7 +173,7 @@ class VectorSearchService:
             self.producer = AsyncKafkaProducer(KAFKA_CONFIG['bootstrap_servers'])
             logger.info("✅ Kafka producer initialized successfully")
         except Exception as e:
-            logger.warning(f"⚠️  Failed to initialize Kafka producer: {str(e)}")
+            logger.warning(f"⚠️ Failed to initialize Kafka producer: {str(e)}")
             self.producer = None
         
         # Initialize detectors
@@ -170,12 +182,15 @@ class VectorSearchService:
         self.libraryDetector = LibraryLanguageDetector()
         logger.info("✅ Language detectors initialized")
         
-        # Create a pool of workers for CPU-bound tasks
-        self.process_pool = None
+        # Initialize question indicators
         self.QUESTION_INDICATORS = self._initialize_question_indicators()
        
         logger.info("🎯 VectorSearchService initialization completed!")
             
+            
+        
+        
+
         
         
     def _initialize_question_indicators(self) -> Dict[str, List[str]]:
@@ -245,50 +260,127 @@ class VectorSearchService:
         }
         return question_words
 
-  
+    async def generate_embeddings(self, query: str) -> List[float]:
+        """Generate embeddings for a query with concurrency control and comprehensive logging"""
+        
+        
+        # Check current system load for logging
+        active_tasks = len([t for t in asyncio.all_tasks() if not t.done()])
+        available_embedding_slots = self.embedding_semaphore._value
+        
+        logger.info(f" Embedding request - Query length: {len(query)} chars, "
+                   f"Active tasks: {active_tasks}, Available embedding slots: {available_embedding_slots}")
     
+    
+    async def generate_embeddings(self, query: str) -> List[float]:
+        """Generate embeddings for a list of queries using a thread pool"""
+        
     async def generate_embeddings(self, query: str) -> List[float]:
         """Generate embeddings for a list of queries using a thread pool"""
         try:
             start_time = datetime.datetime.now()
             
-            # Move the embedding generation to a separate thread 
-            # since SentenceTransformer is not async-compatible
-            embeddings = await asyncio.to_thread(self._generate_embeddings_sync_optimized, query)
-            
-            end_time = datetime.datetime.now()
-            logger.info(f"Generated {len(query)} embeddings in {(end_time - start_time).total_seconds()} seconds")
-            return embeddings
-        except Exception as e:
-            logger.error(f"Error generating embeddings: {str(e)}", exc_info=True)
-            raise
-
-    def _generate_embeddings_sync_optimized(self, query: str) -> List[float]:
-        """Optimized synchronous embedding generation"""
-        try:
-            # Performance optimizations
-            with torch.no_grad():  # Disable gradient computation
-                embeddings = self.st_model.encode(
-                    query,
-                    show_progress_bar=False,  # Disable progress bar for single queries
-                    convert_to_numpy=True,    # Direct numpy conversion
-                    normalize_embeddings=True,  # Normalize for cosine similarity
-                    batch_size=1,            # Single query batch
-                    device=self.device       # Explicit device specification
+            # Apply concurrency control - critical for CPU-limited F16 VM
+            async with self.embedding_semaphore:
+                semaphore_acquired_time = datetime.datetime.now()
+                wait_time = (semaphore_acquired_time - start_time).total_seconds()
+                
+                if wait_time > 0.1:  # Log if we had to wait
+                    logger.info(f" Waited {wait_time:.2f}s for embedding semaphore")
+                
+                # Move the embedding generation to a separate thread 
+                # since SentenceTransformer is not async-compatible
+                embeddings = await asyncio.to_thread(
+                    self._generate_embeddings_sync_optimized, 
+                    query, 
+                    tracking_id
                 )
             
-            # Convert to list efficiently
-            if isinstance(embeddings, np.ndarray):
-                return embeddings.tolist()
-            else:
-                return embeddings
-                
+            end_time = datetime.datetime.now()
+            total_time = (end_time - start_time).total_seconds()
+            processing_time = (end_time - semaphore_acquired_time).total_seconds()
+            
+            logger.info(f" Generated embeddings for query (length: {len(query)}) - "
+                       f"Total time: {total_time:.3f}s (wait: {wait_time:.3f}s, processing: {processing_time:.3f}s), "
+                       f"Device: {self.device}, Output dimension: {len(embeddings)}")
+            
+            return embeddings
+            
         except Exception as e:
-            logger.error(f"❌ Error in sync embedding generation: {str(e)}")
+            error_time = datetime.datetime.now()
+            total_error_time = (error_time - start_time).total_seconds()
+            logger.error(f" Error generating embeddings after {total_error_time:.3f}s: {str(e)}", 
+                        exc_info=True)
             raise
 
-
-
+    def _generate_embeddings_sync_optimized(self, query: str, tracking_id: str = "NA") -> List[float]:
+        """Optimized synchronous embedding generation with detailed performance logging"""
+        try:
+            process_start = datetime.datetime.now()
+            
+            # Log system resources before processing
+            if self.device == 'cpu':
+                cpu_percent = psutil.cpu_percent(interval=None)
+                memory_percent = psutil.virtual_memory().percent
+                logger.debug(f" Pre-embedding system state - CPU: {cpu_percent}%, Memory: {memory_percent}%")
+            
+            # Performance optimizations
+            with torch.no_grad():  # Disable gradient computation
+                encoding_start = datetime.datetime.now()
+                
+                # CPU-specific optimizations for F16 VM
+                encode_params = {
+                    'show_progress_bar': False,      # Disable progress bar for single queries
+                    'convert_to_numpy': True,        # Direct numpy conversion
+                    'normalize_embeddings': True,    # Normalize for cosine similarity
+                    'batch_size': 1,                 # Single query batch
+                    'device': self.device            # Explicit device specification
+                }
+                
+                # Add CPU-specific parameters to prevent thread oversubscription
+                if self.device == 'cpu':
+                    encode_params['num_workers'] = 1  # Prevent CPU oversubscription on F16
+                
+                embeddings = self.st_model.encode(query, **encode_params)
+                
+                encoding_end = datetime.datetime.now()
+                encoding_time = (encoding_end - encoding_start).total_seconds()
+                
+                logger.debug(f" Model encoding completed in {encoding_time:.3f}s on {self.device}")
+            
+            # Convert to list efficiently
+            conversion_start = datetime.datetime.now()
+            if isinstance(embeddings, np.ndarray):
+                result = embeddings.tolist()
+            else:
+                result = embeddings
+            
+            conversion_end = datetime.datetime.now()
+            conversion_time = (conversion_end - conversion_start).total_seconds()
+            
+            total_sync_time = (conversion_end - process_start).total_seconds()
+            
+            # Comprehensive performance logging
+            logger.info(f" Sync embedding generation completed - "
+                       f"Total: {total_sync_time:.3f}s (encoding: {encoding_time:.3f}s, "
+                       f"conversion: {conversion_time:.3f}s), Device: {self.device}, "
+                       f"Input chars: {len(query)}, Output dims: {len(result)}")
+            
+            # Log post-processing system state for CPU
+            if self.device == 'cpu':
+                cpu_percent_after = psutil.cpu_percent(interval=None)
+                memory_percent_after = psutil.virtual_memory().percent
+                logger.debug(f"Post-embedding system state - "
+                           f"CPU: {cpu_percent_after}%, Memory: {memory_percent_after}%")
+                
+            return result
+                
+        except Exception as e:
+            error_time = datetime.datetime.now()
+            error_duration = (error_time - process_start).total_seconds()
+            logger.error(f"❌ Error in sync embedding generation after {error_duration:.3f}s: {str(e)}", 
+                        exc_info=True)
+            raise
 
     async def search_elasticsearch_with_enhanced_chunking(
         self, 
@@ -299,10 +391,9 @@ class VectorSearchService:
         metadata_filters: Optional[Dict[str, Any]] = None,
         include_context: bool = True,
         original_query: Optional[str] = None
-    ) -> List[Dict[str, Any]]:
-        """
-        Enhanced search that works with improved chunking but keeps interface simple
-        """
+    ) -> Dict[str, Any]:
+        """Enhanced search that works with improved chunking but keeps interface simple"""
+        
         try:
             # Build basic filter conditions
             filter_conditions = [{"term": {"tenantId": tenant_id}}]
@@ -398,11 +489,11 @@ class VectorSearchService:
                 for hit in response['hits']['hits']:
                     score = hit['_score']
                     if score >= threshold:
-                        enhanced_content = await self._get_chunk_with_adjacent_context(
+                        enhanced_content = await self._get_chunk_with_adjacent_context_dict(
                             hit['_source'], 
                             tenant_id
                         )
-                        results["contents"].append(enhanced_content)
+                        results["contents"].append(enhanced_content['content'])  # Extract content string
             else:
                 # Simple content only
                 for hit in response['hits']['hits']:
@@ -416,14 +507,14 @@ class VectorSearchService:
             logger.error(f"Error searching Elasticsearch: {str(e)}", exc_info=True)
             raise
 
-    async def _get_chunk_with_adjacent_context(
+    async def _get_chunk_with_adjacent_context_dict(
             self, 
             chunk_source: Dict[str, Any], 
             tenant_id: str
         ) -> Dict[str, Any]:
-        """
-        Get chunk content with adjacent context - simplified version
-        """
+        """Get chunk content with adjacent context - returns Dict"""
+        
+        
         try:
             document_id = chunk_source.get('documentId')
             current_position = chunk_source.get('chunkPosition', 0)
@@ -487,19 +578,18 @@ class VectorSearchService:
                             base_content['content'] = ' ... '.join(context_parts)
                             
                     except Exception as e:
-                        logger.warning(f"Could not fetch adjacent context: {str(e)}")
+                        logger.warning(f" Could not fetch adjacent context: {str(e)}")
             
             return base_content
             
         except Exception as e:
-            logger.error(f"Error getting chunk with context: {str(e)}")
+            logger.error(f" Error getting chunk with context: {str(e)}")
             return {
                 'content': chunk_source.get('content', ''),
                 'sectionTitle': chunk_source.get('sectionTitle', ''),
                 'documentId': chunk_source.get('documentId', ''),
                 'metadata': chunk_source.get('metadata', {})
             }
-
 
     def _is_question(self, query: str) -> bool:
         """Check if query is a question"""
@@ -514,102 +604,8 @@ class VectorSearchService:
         first_word = query_lower.split()[0] if query_lower.split() else ""
         return first_word in question_indicators
 
- 
-    async def _get_chunk_with_adjacent_context(self, chunk_data: Dict, tenant_id: str) -> str:
-        """Get chunk content enhanced with adjacent context"""
-        try:
-            document_id = chunk_data.get('documentId')
-            chunk_position = chunk_data.get('chunkPosition')
-            total_chunks = chunk_data.get('totalChunks')
-            main_content = chunk_data.get('content', '')
-            
-            # If no position info, return original content
-            if chunk_position is None or total_chunks is None or document_id is None:
-                return main_content
-            
-            # Determine adjacent positions to fetch
-            adjacent_positions = []
-            if chunk_position > 0:
-                adjacent_positions.append(chunk_position - 1)  # Previous chunk
-            if chunk_position < total_chunks - 1:
-                adjacent_positions.append(chunk_position + 1)  # Next chunk
-            
-            # If no adjacent chunks, return main content
-            if not adjacent_positions:
-                return main_content
-            
-            # Query for adjacent chunks
-            adjacent_query = {
-                "query": {
-                    "bool": {
-                        "must": [
-                            {"term": {"tenantId": tenant_id}},
-                            {"term": {"documentId": document_id}},
-                            {"terms": {"chunkPosition": adjacent_positions}}
-                        ]
-                    }
-                },
-                "sort": [{"chunkPosition": "asc"}],
-                "size": len(adjacent_positions),
-                "_source": ["content", "chunkPosition"]
-            }
-            
-            adjacent_response = await self.es_client.search(
-                index=ES_CONFIG['tenant_document_index_name'],
-                body=adjacent_query
-            )
-            
-            # Build enhanced content with context
-            prev_content = ""
-            next_content = ""
-            
-            for adj_hit in adjacent_response['hits']['hits']:
-                adj_data = adj_hit['_source']
-                adj_position = adj_data['chunkPosition']
-                
-                if adj_position == chunk_position - 1:  # Previous chunk
-                    prev_content = adj_data['content']
-                elif adj_position == chunk_position + 1:  # Next chunk
-                    next_content = adj_data['content']
-            
-            # Construct enhanced content
-            enhanced_content = ""
-            
-            if prev_content:
-                # Add relevant portion of previous chunk
-                prev_words = prev_content.split()
-                # Take last 30-50 words for context
-                context_size = min(50, len(prev_words) // 2)
-                if context_size > 0:
-                    prev_context = " ".join(prev_words[-context_size:])
-                    enhanced_content += f"[...{prev_context}] "
-            
-            # Add main content
-            enhanced_content += main_content
-            
-            if next_content:
-                # Add relevant portion of next chunk
-                next_words = next_content.split()
-                # Take first 30-50 words for context
-                context_size = min(50, len(next_words) // 2)
-                if context_size > 0:
-                    next_context = " ".join(next_words[:context_size])
-                    enhanced_content += f" [{next_context}...]"
-            
-            return enhanced_content
-            
-        except Exception as e:
-            logger.error(f"Error getting adjacent context: {str(e)}")
-            # Return original content if context retrieval fails
-            return chunk_data.get('content', '')
-
-
     def get_model_driven_token_allocation(self, language: str, base_tokens: int) -> dict:
-        """
-        Give model flexible token ranges to decide appropriate response length
-        """
-    
-        
+        """Give model flexible token ranges to decide appropriate response length"""
         # Apply language multiplier
         multiplier = self.get_language_token_multiplier(language)
         max_tokens = int(base_tokens * multiplier)
@@ -623,25 +619,23 @@ class VectorSearchService:
         }
 
     def create_intelligent_system_prompt(self, language: str, tone: str, max_tokens: int) -> str:
-        """
-        Create system prompt that lets model decide response length based on query
-        """
+        """Create system prompt that lets model decide response length based on query"""
         language_name = self.manualDetector.supported_languages.get(language, {}).get('name', 'English')
         
         return f"""You are a customer support AI assistant. Your role is to provide accurate, helpful answers to customer questions.
 
-    STRICT REQUIREMENTS:
-    1. ONLY use information from the provided context - never invent details
-    2. Write in {language_name} with a {tone} tone
-    3. DECIDE THE APPROPRIATE RESPONSE LENGTH based on what the user is asking:
-    - If user asks for brief/quick/short answer: Give 1-2 sentences
-    - If user asks for detailed/comprehensive explanation: Give complete explanation
-    - For regular questions: Give appropriately detailed response (2-4 sentences typically)
-    4. Maximum limit: {max_tokens} tokens - never exceed this
-    5. Give direct, actionable answers
-    6. If information is not in the context, return exactly: "NO_ANSWER_FOUND"
-    7. Always complete your sentences - never cut off mid-word
-    8. Focus on answering the customer's specific question"""
+STRICT REQUIREMENTS:
+1. ONLY use information from the provided context - never invent details
+2. Write in {language_name} with a {tone} tone
+3. DECIDE THE APPROPRIATE RESPONSE LENGTH based on what the user is asking:
+- If user asks for brief/quick/short answer: Give 1-2 sentences
+- If user asks for detailed/comprehensive explanation: Give complete explanation
+- For regular questions: Give appropriately detailed response (2-4 sentences typically)
+4. Maximum limit: {max_tokens} tokens - never exceed this
+5. Give direct, actionable answers
+6. If information is not in the context, return exactly: "NO_ANSWER_FOUND"
+7. Always complete your sentences - never cut off mid-word
+8. Focus on answering the customer's specific question"""
 
     async def generate_answer_from_mistral_or_azure(
         self,
@@ -651,13 +645,12 @@ class VectorSearchService:
         tone: str = "polite",
         max_length: int = 200,
     ) -> Dict[str, Any]:
-        """
-        Generate customer support answers with model-driven length decisions.
-        """
+        """Generate customer support answers with model-driven length decisions."""
+        
+        
         try:
-
             # Get model-driven token allocation
-            token_info = self.get_model_driven_token_allocation(language,max_length)
+            token_info = self.get_model_driven_token_allocation(language, max_length)
             max_tokens = token_info["max_tokens"]
             
             # Combine context
@@ -669,13 +662,12 @@ class VectorSearchService:
             # Simple user prompt - let model analyze the query
             user_prompt = f"""Context: {context}
 
-    Customer Question: {query}
+Customer Question: {query}
 
-    Provide an appropriate response in {self.manualDetector.supported_languages.get(language, {}).get('name', 'English')}."""
+Provide an appropriate response in {self.manualDetector.supported_languages.get(language, {}).get('name', 'English')}."""
 
             # Log the parameters
-            logger.info("Model-driven request: language=%s, max_tokens=%d, multiplier=%.1f", 
-                    language, max_length, token_info["multiplier"])
+            logger.info(f" Model-driven request: language={language}, max_tokens={max_tokens}, multiplier={token_info['multiplier']:.1f}")
 
             if isMistralEnabledForFAQ:
                 # Mistral API call
@@ -699,11 +691,11 @@ class VectorSearchService:
                 )
 
                 if response.status_code != 200:
-                    logger.error(f"Mistral LLM error: {response.status_code} - {response.text}")
+                    logger.error(f" Mistral LLM error: {response.status_code} - {response.text}")
                     return {"error": f"Mistral LLM returned status {response.status_code}"}
 
                 mistral_response = response.json()
-                logger.info(f"mistral_response : {mistral_response}")
+                logger.info(f" mistral_response: {mistral_response}")
                 
                 try:
                     # Handle both Ollama and OpenAI-compatible response formats
@@ -719,7 +711,7 @@ class VectorSearchService:
                         }
                     }
                 except (KeyError, IndexError) as e:
-                    logger.error(f"Unexpected Mistral response format: {mistral_response}")
+                    logger.error(f" Unexpected Mistral response format: {mistral_response}")
                     return {
                         "message": {
                             "content": content
@@ -730,7 +722,7 @@ class VectorSearchService:
                 # Azure OpenAI Service
                 azure_client = AzureOpenAIServiceClient()
 
-                logger.info(f" system_prompt : {system_prompt} , user_prompt: {user_prompt}, max_tokens : {max_tokens}")
+                logger.info(f" system_prompt: {system_prompt}, user_prompt: {user_prompt}, max_tokens: {max_tokens}")
                 azure_response = await azure_client.generate_answer(
                     system_prompt=system_prompt,
                     user_prompt=user_prompt,
@@ -753,18 +745,15 @@ class VectorSearchService:
                 elif "error" in azure_response:
                     return azure_response
                 else:
-                    logger.error(f"Unexpected Azure response format: {azure_response}")
+                    logger.error(f" Unexpected Azure response format: {azure_response}")
                     return {"error": f"Unexpected Azure response format"}
 
         except Exception as e:
-            logger.error(f"Error generating customer support answer: {str(e)}", exc_info=True)
+            logger.error(f" Error generating customer support answer: {str(e)}", exc_info=True)
             return {"error": f"Error generating answer: {str(e)}"}
 
-
     def get_language_token_multiplier(self, language: str) -> float:
-        """
-        Get token multiplier based on language efficiency using language codes
-        """
+        """Get token multiplier based on language efficiency using language codes"""
         language = language.lower()
         
         # High efficiency languages (fewer tokens needed)
@@ -847,44 +836,6 @@ class VectorSearchService:
                 lower_efficiency.get(language) or 
                 1.5)  # Default for unknown languages
 
-    def get_language_aware_token_length(self, base_tokens: int, language: str) -> int:
-        """
-        Adjust token length based on language characteristics using language codes
-        """
-        multiplier = self.get_language_token_multiplier(language)
-        adjusted_tokens = int(base_tokens * multiplier)
-        
-        # Cap maximum tokens to prevent excessive costs
-        max_allowed = 800
-        return min(adjusted_tokens, max_allowed)
-
-    def get_language_length_instruction(self, max_length: int, language: str, target_words: int) -> str:
-        """
-        Get appropriate length instruction based on language characteristics
-        """
-        language = language.lower()
-        
-        # Character-based languages
-        if language in ['zh', 'zh-tw', 'ja', 'ko', 'th']:
-            target_chars = max_length * 2
-            if max_length <= 100:
-                return f"Answer in 1-2 clear sentences (maximum {target_chars} characters)"
-            elif max_length <= 200:
-                return f"Answer in 2-3 sentences (maximum {target_chars} characters)"
-            else:
-                return f"Answer in 3-4 sentences (maximum {target_chars} characters)"
-        
-        # Word-based languages (all others)
-        else:
-            if max_length <= 100:
-                return f"Answer in 1-2 clear sentences (maximum {target_words} words)"
-            elif max_length <= 250:
-                return f"Answer in 2-3 sentences (maximum {target_words} words)"
-            else:
-                return f"Answer in 3-4 sentences (maximum {target_words} words)"
-
-
-         
     async def process_search_request(
         self, 
         query: str, 
@@ -896,112 +847,115 @@ class VectorSearchService:
         answer_tone: str = "polite",
         max_answer_length: int = 300
     ) -> Dict[str, Any]:
-        """Process a search request end-to-end using async operations"""
+        """Process a search request end-to-end with concurrency control"""
         
+        
+        # Apply overall processing concurrency control
+        async with self.processing_semaphore:
+            available_processing_slots = self.processing_semaphore._value
+            logger.info(f" Processing search request - Available processing slots: {available_processing_slots}")
+            
+            # Generate embeddings for all queries
+            embedding = await self.generate_embeddings(query)
+            
+            metadata_filters_final = {}
+            if language and language != "unknown":
+                metadata_filters_final["language"] = language
+                    
+            # Create tasks for concurrent Elasticsearch searches
+            search_result = await self.search_elasticsearch_with_enhanced_chunking(
+                    embedding, 
+                    tenant_id,
+                    top_k, 
+                    threshold,
+                    metadata_filters_final, 
+                    True,
+                    query  # Pass original query for hybrid search
+                ) 
+            
+            logger.info(f" Search completed - Found {len(search_result.get('contents', []))} contents")
+            
+            if search_result["contents"]:
+                response = await self.generate_answer_from_mistral_or_azure(
+                    query,
+                    search_result["contents"],
+                    language=language,
+                    tone=answer_tone,
+                    max_length=max_answer_length,
+                )
 
-        # Generate embeddings for all queries
-        embedding = await self.generate_embeddings(query)
-        
-        metadata_filters={}
-        if language and language != "unknown":
-            metadata_filters["language"] = language
+                # Add extracted details to search_result
+                message = response.get("message", {})
+                content = message.get("content", "")
+
+                search_result["answer"] = content
+                # Convert nanoseconds to milliseconds for better integer-based analytics
+                search_result["total_duration"] = int(response.get("total_duration", 0) / 1_000_000)
+                search_result["load_duration"] = int(response.get("load_duration", 0) / 1_000_000)
+                search_result["prompt_eval_duration"] = int(response.get("prompt_eval_duration", 0) / 1_000_000)
+                search_result["eval_duration"] = int(response.get("eval_duration", 0) / 1_000_000)
+
+                logger.info(f" Generated response - Length: {len(content)} chars, "
+                          f"Total Duration: {search_result['total_duration']}ms")
+            else:
+                search_result["answer"] = ""
+                search_result["total_duration"] = 0
+                search_result["load_duration"] = 0
+                search_result["prompt_eval_duration"] = 0
+                search_result["eval_duration"] = 0
                 
-        # Create tasks for concurrent Elasticsearch searches
-        search_result = await self.search_elasticsearch_with_enhanced_chunking(
-                embedding, 
-                tenant_id,
-                top_k, 
-                threshold,
-                metadata_filters,True
-            ) 
-        
-        
-        logger.info(f"contents: {search_result['contents']}, ");
-        
-        if search_result["contents"]:
-            response = await self.generate_answer_from_mistral_or_azure(
-                query,
-                search_result["contents"],
-                language=language,
-                tone=answer_tone,
-                max_length=max_answer_length,
-            )
+                logger.info(f" No content found for query")
 
-            # Add extracted details to search_result
-            message = response.get("message", {})
-            content = message.get("content", "")
+            return search_result
 
-            search_result["answer"] = content
-            # Convert nanoseconds to milliseconds for better integer-based analytics
-            search_result["total_duration"] = int(response.get("total_duration", 0) / 1_000_000)  # nano to milli
-            search_result["load_duration"] = int(response.get("load_duration", 0) / 1_000_000)
-            search_result["prompt_eval_duration"] = int(response.get("prompt_eval_duration", 0) / 1_000_000)
-            search_result["eval_duration"] = int(response.get("eval_duration", 0) / 1_000_000)
-
-            logger.info(
-                f"Processed search request for query: {query}, "
-                f"Response: {search_result['answer']}, "
-                f"Total Duration: {search_result['total_duration']}, "
-                f"Load Duration: {search_result['load_duration']}"
-            )
-
-          
-
-        else:
-            search_result["answer"] =  ""
-            search_result["total_duration"] = 0
-            search_result["load_duration"] = 0
-            search_result["prompt_eval_duration"] = 0
-            search_result["eval_duration"] = 0
-
-
+    async def publish_analytics_report_to_kafka(self, tenant_id: str, topic: str, analyticsDto: AIGeneratedSearchResultDto):
+        """Publishes analytics data to a Kafka topic."""
 
 
         return search_result  # Returning updated search_result
         
-    def get_no_results_response(self, language_code: str) -> str:
-        """
-        Get random no-results response in the user's language
-        """
-        # Default to English if language not found
-        responses = self.manualDetector.no_results_responses.get(language_code, self.no_results_responses.get('en', [
-            "I'm sorry, but I couldn't find an answer. Could you rephrase?"
-        ]))
-    
-        return random.choice(responses)
-
-    async def publish_analytics_report_to_kafka(self, tenant_id:str, topic: str, analyticsDto: AIGeneratedSearchResultDto):
-        """
-        Publishes analytics data to a Kafka topic.
-        """
-        # Serialize key and value
-        serialized_key = str(tenant_id).encode("utf-8")
-        serialized_analytics = json.dumps(analyticsDto.model_dump(), default=str).encode("utf-8")
-
-        # Create an asyncio Future to wait for delivery report
-        future = asyncio.Future()
+        return search_result  # Returning updated search_result
         
-        def delivery_callback(err, msg):
-            if err:
-                future.set_exception(Exception(f"Message delivery failed: {err}"))
-            else:
-                future.set_result(msg)
-        
-        self.producer._produce(topic, key=serialized_key, value=serialized_analytics, callback=delivery_callback)
-        
-        return await future
+        try:
+            # Serialize key and value
+            serialized_key = str(tenant_id).encode("utf-8")
+            serialized_analytics = json.dumps(analyticsDto.model_dump(), default=str).encode("utf-8")
 
+            # Create an asyncio Future to wait for delivery report
+            future = asyncio.Future()
+            
+            def delivery_callback(err, msg):
+                if err:
+                    future.set_exception(Exception(f"Message delivery failed: {err}"))
+                else:
+                    future.set_result(msg)
+            
+            # Use asyncio.to_thread to make Kafka produce operation non-blocking
+            await asyncio.to_thread(
+                self.producer._produce, 
+                topic, 
+                key=serialized_key, 
+                value=serialized_analytics, 
+                callback=delivery_callback
+            )
+            
+            return await future
+            
+        except Exception as e:
+            logger.error(f" Failed to publish analytics to Kafka: {str(e)}")
+            raise
 
-    def detect_best_language(self,text):
-        # 1. For very short texts, try pattern matching first
-        if len(text.split()) >= 5:  # Short customer queries
+    def detect_best_language(self, text):
+        """Detect language with fallback chain"""
+        # 1. For longer texts, try pattern matching first
+        if len(text.split()) >= 5:
             service_lang = self.manualDetector.make_best_guess(text)
             return service_lang
                 
         # 2. Try libraries next
         if len(self.libraryDetector.available_libraries) > 0:
             lib_signals = self.libraryDetector._detect_with_libraries(text)
-            logger.info(f" libraryDetector {lib_signals} ")
+            logger.info(f"libraryDetector {lib_signals}")
             
             if lib_signals:
                 # Get best library result
@@ -1010,16 +964,16 @@ class VectorSearchService:
                 if conf > 0.5:  # If reasonably confident
                     return lang
                     
-        # 3. Fall back to combined approach
+        # 3. Fall back to English
         return 'en'
 
-
-    def get_best_response(self,language):
+    def get_best_response(self, language):
+        """Get no-results response in specified language"""
         return self.manualDetector.get_no_results_message(language)
 
     def handle_greeting(self, message, language):
-        return self.manualDetector.handle_greeting(message,language)
-
+        """Handle greeting detection and response"""
+        return self.manualDetector.handle_greeting(message, language)
 
     async def close(self):
         """Close connections and resources"""
@@ -1059,7 +1013,7 @@ async def startup_event():
             if es_healthy:
                 logger.info("✅ Elasticsearch connection: HEALTHY")
             else:
-                logger.warning("⚠️  Elasticsearch connection: FAILED")
+                logger.warning("⚠️ Elasticsearch connection: FAILED")
         except Exception as e:
             logger.error(f"❌ Elasticsearch connection error: {str(e)}")
         
@@ -1072,9 +1026,9 @@ async def startup_event():
             if response.status_code == 200:
                 logger.info("✅ Mistral service connection: HEALTHY")
             else:
-                logger.warning(f"⚠️  Mistral service responded with status: {response.status_code}")
+                logger.warning(f"⚠️ Mistral service responded with status: {response.status_code}")
         except Exception as e:
-            logger.warning(f"⚠️  Mistral service connection: {str(e)}")
+            logger.warning(f"⚠️ Mistral service connection: {str(e)}")
         
         # Check model loading
         if hasattr(app.state.search_service, 'st_model'):
@@ -1086,7 +1040,7 @@ async def startup_event():
         if app.state.search_service.producer and app.state.search_service.producer.is_connected:
             logger.info("✅ Kafka producer: CONNECTED")
         else:
-            logger.warning("⚠️  Kafka producer: NOT CONNECTED")
+            logger.warning("⚠️ Kafka producer: NOT CONNECTED")
         
         logger.info("=" * 60)
         logger.info("🎉 VECTOR SEARCH SERVICE STARTED SUCCESSFULLY")
@@ -1102,17 +1056,9 @@ async def startup_event():
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    # Close Kafka producer
+    # Close connections
     if hasattr(app.state, 'search_service'):
         await app.state.search_service.close()
-    
-    # Cancel consumer task
-    if hasattr(app.state, 'consumer_task'):
-        app.state.consumer_task.cancel()
-        try:
-            await app.state.consumer_task
-        except asyncio.CancelledError:
-            pass
     
     logger.info("Vector Search Service shut down")
 
@@ -1125,7 +1071,9 @@ async def search(
     request: AISearchRequest,
     search_service: VectorSearchService = Depends(get_search_service)
 ):
-    """Endpoint to search documents using vector similarity"""
+    """Endpoint to search documents using vector similarity with proper concurrency control"""
+    
+    
     try:
         # Generate a request ID for this specific request
         tracking_id = tracking_id_var.get() or "NA"
@@ -1134,19 +1082,17 @@ async def search(
         if not request.language:
             # Use your language detection logic here
             detected_language = search_service.detect_best_language(request.query)
-            logger.info(f"detected_language : {detected_language}")
+            logger.info(f" detected_language: {detected_language}")
             request.language = detected_language
-          
 
-        greeting = search_service.handle_greeting(request.query,request.language)
+        greeting = search_service.handle_greeting(request.query, request.language)
 
-          # If greeting is detected, return the greeting response directly
+        # If greeting is detected, return the greeting response directly
         if greeting:
             logger.info(f"[{tracking_id}] Greeting detected, responding with appropriate greeting")
             return AISearchResultDto(isGreeting = True,result=greeting, requestId=tracking_id, contentSize=0)
 
-
-
+        # Process search with concurrency control
         responseData = await search_service.process_search_request(
             request.query,
             request.tenantId,
@@ -1158,24 +1104,23 @@ async def search(
             request.maxAnswerLength
         )
 
-        logger.info(f"responseData: {responseData}")
+        logger.info(f" Search processing completed")
         
-         # Extract analytics data from response if it has mistral performance metrics
+        # Extract analytics data from response if it has performance metrics
         if responseData and isinstance(responseData, dict) and 'total_duration' in responseData:
             analytics_data = AIGeneratedSearchResultDto(
                 tenantId=request.tenantId,
                 query=request.query,
-                answer=  responseData.get("answer",''),
-                contents = responseData.get('contents', []),
-                documentId= responseData.get('documentId', ''), 
+                answer=responseData.get("answer", ''),
+                contents=responseData.get('contents', []),
+                documentId=responseData.get('documentId', ''), 
                 totalDuration=responseData.get('total_duration', 0),
                 loadDuration=responseData.get('load_duration', 0),
                 promptEvalDuration=responseData.get('prompt_eval_duration', 0),
                 evalDuration=responseData.get('eval_duration', 0)
             )
             
-            # Send results to Kafka asynchronously
-            # We use create_task to fire and forget
+            # Send results to Kafka asynchronously (fire and forget)
             asyncio.create_task(
                 search_service.publish_analytics_report_to_kafka(
                     request.tenantId,
@@ -1183,26 +1128,22 @@ async def search(
                     analytics_data
                 )
             )
-        
 
-        answer  = responseData.get('answer')
+        answer = responseData.get('answer')
         content_size = len(responseData.get("contents", []))
-        print(content_size)
-        if not answer or answer == "NO_ANSWER_FOUND" or answer == '""' or answer == '':
-            language = request.language.lower()  # Get language from request
-            answer = search_service.get_best_response(language)
-            content_size = 0;
         
+        if not answer or answer == "NO_ANSWER_FOUND" or answer in ['""', '']:
+            language = request.language.lower()
+            answer = search_service.get_best_response(language)
+            content_size = 0
 
-        logger.info(f"[{tracking_id}] Search completed successfully")
-        return AISearchResultDto(isGreeting =False, result=answer, requestId=tracking_id, contentSize =content_size)
+        logger.info(f" Search completed successfully")
+        return AISearchResultDto(isGreeting=False, result=answer, requestId=tracking_id, contentSize=content_size)
 
-       
     except Exception as e:
         error_msg = f"Search request failed: {str(e)}"
-        logger.error(f"[{tracking_id}] {error_msg}", exc_info=True)
+        logger.error(f" {error_msg}", exc_info=True)
         
-        # Return a custom error response that includes the X-Tracking-ID
         raise HTTPException(
             status_code=500, 
             detail={"error": 'Something went wrong', "X-Tracking-ID": tracking_id}
@@ -1210,7 +1151,7 @@ async def search(
 
 @app.get("/health")
 async def health_check(search_service: VectorSearchService = Depends(get_search_service)):
-    """Enhanced health check endpoint with detailed logging"""
+    """Enhanced health check endpoint with system monitoring"""
     health_check_id = str(uuid.uuid4())[:8]
     logger.info(f"🏥 [{health_check_id}] Health check requested")
     
@@ -1220,7 +1161,16 @@ async def health_check(search_service: VectorSearchService = Depends(get_search_
             "service": "Vector Search Service",
             "version": "1.0.0",
             "status": "unknown",
-            "components": {}
+            "components": {},
+            "system_info": {
+                "device": search_service.device,
+                "cpu_count": psutil.cpu_count(),
+                "memory_total_gb": round(psutil.virtual_memory().total / (1024**3), 1),
+                "cpu_percent": psutil.cpu_percent(interval=1),
+                "memory_percent": psutil.virtual_memory().percent,
+                "available_embedding_slots": search_service.embedding_semaphore._value,
+                "available_processing_slots": search_service.processing_semaphore._value
+            }
         }
         
         # Check Elasticsearch connection
@@ -1244,7 +1194,8 @@ async def health_check(search_service: VectorSearchService = Depends(get_search_
         logger.info(f"🤖 [{health_check_id}] Checking model status...")
         model_healthy = hasattr(search_service, 'st_model') and search_service.st_model is not None
         health_status["components"]["sentence_transformer"] = {
-            "status": "healthy" if model_healthy else "unhealthy"
+            "status": "healthy" if model_healthy else "unhealthy",
+            "device": search_service.device
         }
         logger.info(f"✅ [{health_check_id}] Model: {'LOADED' if model_healthy else 'NOT LOADED'}")
         
@@ -1268,7 +1219,7 @@ async def health_check(search_service: VectorSearchService = Depends(get_search_
                 "status": "unhealthy",
                 "error": str(e)
             }
-            logger.warning(f"⚠️  [{health_check_id}] Mistral service check failed: {str(e)}")
+            logger.warning(f"⚠️ [{health_check_id}] Mistral service check failed: {str(e)}")
         
         # Check Kafka producer
         logger.info(f"📨 [{health_check_id}] Checking Kafka producer...")
@@ -1289,7 +1240,7 @@ async def health_check(search_service: VectorSearchService = Depends(get_search_
         if overall_healthy:
             logger.info(f"🎉 [{health_check_id}] Overall health check: PASSED")
         else:
-            logger.warning(f"⚠️  [{health_check_id}] Overall health check: FAILED")
+            logger.warning(f"⚠️ [{health_check_id}] Overall health check: FAILED")
         
         # Return appropriate response
         if not overall_healthy:
@@ -1307,6 +1258,20 @@ async def health_check(search_service: VectorSearchService = Depends(get_search_
             "timestamp": datetime.datetime.now().isoformat()
         })
 
+@app.get("/metrics")
+async def get_metrics(search_service: VectorSearchService = Depends(get_search_service)):
+    """System metrics endpoint for monitoring"""
+    return {
+        "timestamp": datetime.datetime.now().isoformat(),
+        "concurrent_requests": len([t for t in asyncio.all_tasks() if not t.done()]),
+        "cpu_usage": psutil.cpu_percent(interval=1),
+        "memory_usage": psutil.virtual_memory().percent,
+        "available_embedding_slots": search_service.embedding_semaphore._value,
+        "available_processing_slots": search_service.processing_semaphore._value,
+        "device": search_service.device,
+        "load_average": getattr(psutil, 'getloadavg', lambda: [0, 0, 0])()[0] if hasattr(psutil, 'getloadavg') else None
+    }
+
 if __name__ == "__main__":
     logger.info("🚀 Starting application with uvicorn...")
     logger.info("📋 Configuration:")
@@ -1315,5 +1280,4 @@ if __name__ == "__main__":
     logger.info(f"   - Reload: True")
     logger.info("🔄 Starting uvicorn server...")
     
-    # Use uvicorn with reload for development
     uvicorn.run("master:app", host="0.0.0.0", port=9001, reload=True)
