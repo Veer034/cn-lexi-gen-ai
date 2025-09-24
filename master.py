@@ -407,51 +407,86 @@ class VectorSearchService:
                         filter_conditions.append({"term": {f"metadata.{key}": value}})
             
             # Build query - hybrid if we have original text, semantic-only otherwise
-            if original_query:
-                # Hybrid search: semantic + keyword (simple version)
-                query = {
-                    "query": {
+            if original_query and original_query.strip():
+                # Hybrid search: semantic + keyword with safe field handling
+                should_queries = [
+                    # Semantic search with normalized scoring (always works)
+                    {
+                        "script_score": {
+                            "query": {"match_all": {}},
+                            "script": {
+                                "source": "Math.max(0, (cosineSimilarity(params.query_vector, 'contentVector') + 1.0) / 2.0)",
+                                "params": {"query_vector": embedding}
+                            },
+                            "boost": 2.0
+                        }
+                    },
+                    # Core keyword search (always works with content + sectionTitle)
+                    {
+                        "multi_match": {
+                            "query": original_query,
+                            "fields": ["content^2", "sectionTitle^1.5"],
+                            "type": "best_fields",
+                            "boost": 1.0
+                        }
+                    }
+                ]
+                
+                # Add enhanced fields ONLY if they might exist (safe additions)
+                # These will be ignored by ES if fields don't exist
+                enhanced_fields_query = {
+                    "multi_match": {
+                        "query": original_query,
+                        "fields": ["keywordsText^1.8", "contextSummary^1.3", "keywords^1.5"],
+                        "type": "best_fields",
+                        "boost": 1.2
+                    }
+                }
+                should_queries.append(enhanced_fields_query)
+                
+                # FAQ boost for question-like queries (safe - uses existing chunkType)
+                if self._is_question(original_query):
+                    faq_query = {
                         "bool": {
-                            "filter": filter_conditions,
                             "should": [
-                                # Semantic search with normalized scoring
-                                {
-                                    "script_score": {
-                                        "query": {"match_all": {}},
-                                        "script": {
-                                            "source": "Math.max(0, (cosineSimilarity(params.query_vector, 'contentVector') + 1.0) / 2.0)",
-                                            "params": {"query_vector": embedding}
-                                        },
-                                        "boost": 2.0
-                                    }
-                                },
-                                # Simple keyword search
-                                {
-                                    "multi_match": {
-                                        "query": original_query,
-                                        "fields": ["content^2", "keywords^1.5", "sectionTitle"],
-                                        "type": "best_fields",
-                                        "boost": 1.0
-                                    }
-                                },
-                                # Boost FAQ content for question-like queries
                                 {
                                     "bool": {
                                         "must": [
                                             {"wildcard": {"chunkType": "*faq*"}},
                                             {"match": {"content": original_query}}
-                                        ],
-                                        "boost": 1.5 if self._is_question(original_query) else 1.0
+                                        ]
+                                    }
+                                },
+                                # Safe metadata check - won't fail if field missing
+                                {
+                                    "bool": {
+                                        "must": [
+                                            {"term": {"metadata.hasQuestion": True}},
+                                            {"match": {"content": original_query}}
+                                        ]
                                     }
                                 }
                             ],
+                            "boost": 1.5
+                        }
+                    }
+                    should_queries.append(faq_query)
+
+                query = {
+                    "query": {
+                        "bool": {
+                            "filter": filter_conditions,
+                            "should": should_queries,
                             "minimum_should_match": 1
                         }
                     },
-                    "_source": ["content", "documentId", "chunkPosition", "totalChunks", "sectionTitle", "keywords", "metadata", "chunkType"]
+                    "_source": [
+                        "content", "documentId", "chunkPosition", "totalChunks", 
+                        "sectionTitle", "metadata", "chunkType"
+                    ]
                 }
             else:
-                # Semantic-only search
+                # Semantic-only search (always works)
                 query = {
                     "query": {
                         "script_score": {
@@ -466,7 +501,10 @@ class VectorSearchService:
                             }
                         }
                     },
-                    "_source": ["content", "documentId", "chunkPosition", "totalChunks", "sectionTitle", "keywords", "metadata", "chunkType"]
+                    "_source": [
+                        "content", "documentId", "chunkPosition", "totalChunks", 
+                        "sectionTitle", "metadata", "chunkType"
+                    ]
                 }
 
             logger.info(f"Enhanced search with original_query: {bool(original_query)}")
@@ -508,10 +546,10 @@ class VectorSearchService:
             raise
 
     async def _get_chunk_with_adjacent_context_dict(
-            self, 
-            chunk_source: Dict[str, Any], 
-            tenant_id: str
-        ) -> Dict[str, Any]:
+        self, 
+        chunk_source: Dict[str, Any], 
+        tenant_id: str
+    ) -> Dict[str, Any]:
         """Get chunk content with adjacent context - returns Dict"""
         
         
@@ -578,12 +616,12 @@ class VectorSearchService:
                             base_content['content'] = ' ... '.join(context_parts)
                             
                     except Exception as e:
-                        logger.warning(f" Could not fetch adjacent context: {str(e)}")
+                        logger.warning(f"Could not fetch adjacent context: {str(e)}")
             
             return base_content
             
         except Exception as e:
-            logger.error(f" Error getting chunk with context: {str(e)}")
+            logger.error(f"Error getting chunk with context: {str(e)}")
             return {
                 'content': chunk_source.get('content', ''),
                 'sectionTitle': chunk_source.get('sectionTitle', ''),
@@ -593,6 +631,9 @@ class VectorSearchService:
 
     def _is_question(self, query: str) -> bool:
         """Check if query is a question"""
+        if not query:
+            return False
+            
         question_indicators = ['what', 'how', 'when', 'where', 'why', 'who', 'which', 'can', 'is', 'are', 'do', 'does', 'will', 'would', 'could', 'should']
         query_lower = query.lower().strip()
         
