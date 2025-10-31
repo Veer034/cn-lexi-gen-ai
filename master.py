@@ -260,21 +260,7 @@ class VectorSearchService:
         }
         return question_words
 
-    async def generate_embeddings(self, query: str) -> List[float]:
-        """Generate embeddings for a query with concurrency control and comprehensive logging"""
-        
-        
-        # Check current system load for logging
-        active_tasks = len([t for t in asyncio.all_tasks() if not t.done()])
-        available_embedding_slots = self.embedding_semaphore._value
-        
-        logger.info(f" Embedding request - Query length: {len(query)} chars, "
-                   f"Active tasks: {active_tasks}, Available embedding slots: {available_embedding_slots}")
-    
-    
-    async def generate_embeddings(self, query: str) -> List[float]:
-        """Generate embeddings for a list of queries using a thread pool"""
-        
+     
     async def generate_embeddings(self, query: str) -> List[float]:
         """Generate embeddings for a list of queries using a thread pool"""
         try:
@@ -291,9 +277,8 @@ class VectorSearchService:
                 # Move the embedding generation to a separate thread 
                 # since SentenceTransformer is not async-compatible
                 embeddings = await asyncio.to_thread(
-                    self._generate_embeddings_sync_optimized, 
-                    query, 
-                    tracking_id
+                    self._generate_embeddings_sync_optimized,
+                    query
                 )
             
             end_time = datetime.datetime.now()
@@ -313,7 +298,7 @@ class VectorSearchService:
                         exc_info=True)
             raise
 
-    def _generate_embeddings_sync_optimized(self, query: str, tracking_id: str = "NA") -> List[float]:
+    def _generate_embeddings_sync_optimized(self, query: str) -> List[float]:
         """Optimized synchronous embedding generation with detailed performance logging"""
         try:
             process_start = datetime.datetime.now()
@@ -513,7 +498,9 @@ class VectorSearchService:
             response = await self.es_client.search(
                 index=ES_CONFIG['tenant_document_index_name'],
                 body=query,
-                size=top_k
+                size=top_k,
+                preference="_local",
+                request_cache=True
             )
             
             # Process results - keep it simple
@@ -596,7 +583,9 @@ class VectorSearchService:
                     try:
                         adjacent_response = await self.es_client.search(
                             index=ES_CONFIG['tenant_document_index_name'],
-                            body=adjacent_query
+                            body=adjacent_query,
+                            preference="_local",
+                            request_cache=True
                         )
                         
                         # Simple context addition
@@ -951,12 +940,6 @@ Provide an appropriate response in {self.manualDetector.supported_languages.get(
 
     async def publish_analytics_report_to_kafka(self, tenant_id: str, topic: str, analyticsDto: AIGeneratedSearchResultDto):
         """Publishes analytics data to a Kafka topic."""
-
-
-        return search_result  # Returning updated search_result
-        
-        return search_result  # Returning updated search_result
-        
         try:
             # Serialize key and value
             serialized_key = str(tenant_id).encode("utf-8")
