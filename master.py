@@ -322,9 +322,6 @@ class VectorSearchService:
                     'device': self.device            # Explicit device specification
                 }
                 
-                # Add CPU-specific parameters to prevent thread oversubscription
-                if self.device == 'cpu':
-                    encode_params['num_workers'] = 1  # Prevent CPU oversubscription on F16
                 
                 embeddings = self.st_model.encode(query, **encode_params)
                 
@@ -347,16 +344,16 @@ class VectorSearchService:
             
             # Comprehensive performance logging
             logger.info(f" Sync embedding generation completed - "
-                       f"Total: {total_sync_time:.3f}s (encoding: {encoding_time:.3f}s, "
-                       f"conversion: {conversion_time:.3f}s), Device: {self.device}, "
-                       f"Input chars: {len(query)}, Output dims: {len(result)}")
+                    f"Total: {total_sync_time:.3f}s (encoding: {encoding_time:.3f}s, "
+                    f"conversion: {conversion_time:.3f}s), Device: {self.device}, "
+                    f"Input chars: {len(query)}, Output dims: {len(result)}")
             
             # Log post-processing system state for CPU
             if self.device == 'cpu':
                 cpu_percent_after = psutil.cpu_percent(interval=None)
                 memory_percent_after = psutil.virtual_memory().percent
                 logger.debug(f"Post-embedding system state - "
-                           f"CPU: {cpu_percent_after}%, Memory: {memory_percent_after}%")
+                        f"CPU: {cpu_percent_after}%, Memory: {memory_percent_after}%")
                 
             return result
                 

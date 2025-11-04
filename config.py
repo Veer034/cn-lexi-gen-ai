@@ -26,7 +26,7 @@ MISTRAL_CONFIG = {
     'enabledForFAQ' : os.getenv('MISTRAL_FAQ_ENABLED', False),
     'chat_url': os.getenv('MISTRAL_CHAT_URL', 'http://localhost:11434/api/chat'),
     'version_url': os.getenv('MISTRAL_VERSION_URL', 'http://localhost:11434/api/version'),
-    'model': os.getenv('MISTRAL_MODEL', 'mistral'),
+    'model': os.getenv('MISTRAL_MODEL', 'mistral:7b-instruct-q2_k'),
     'timeout': 120,
 }
 
