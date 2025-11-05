@@ -896,8 +896,8 @@ Provide an appropriate response in {self.manualDetector.supported_languages.get(
                     top_k, 
                     threshold,
                     metadata_filters_final, 
-                    True,
-                    query  # Pass original query for hybrid search
+                    True
+                    # , query  # Pass original query for hybrid search
                 ) 
             
             logger.info(f" Search completed - Found {len(search_result.get('contents', []))} contents")
