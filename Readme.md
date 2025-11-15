@@ -117,9 +117,8 @@ deactivate your virtual environment if it's active:
 
     sudo tee /etc/systemd/system/cn-lexi-gen-ai.service > /dev/null << EOF
     [Unit]
-    Description=For data forging
-    After=network.target ollama.service
-    Requires=ollama.service
+    Description=For AI Response Generation
+    After=network.target
 
     [Service]
     Type=simple
@@ -127,9 +126,15 @@ deactivate your virtual environment if it's active:
     WorkingDirectory=/home/azureuser/cn-lexi-gen-ai
     Environment=PATH=/home/azureuser/cn-lexi-gen-ai/myvenv/bin
     ExecStart=/home/azureuser/cn-lexi-gen-ai/myvenv/bin/python master.py
+
+    TimeoutStartSec=300
+    TimeoutStopSec=60
+
     Restart=always
     RestartSec=10
     StartLimitIntervalSec=0
+    StartLimitBurst=0
+
     StandardOutput=journal
     StandardError=journal
 
